@@ -438,6 +438,16 @@ type SeedPlan = {
 const hex = (b: ArrayBuffer) =>
   [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 
+// crypto.DigestStream is a Workers runtime API. The ambient Crypto type in scope
+// here is the standard one, which does not declare it — and the bare global
+// `DigestStream` that the types suggest does not exist at runtime. Verified
+// against workerd: `typeof DigestStream` is "undefined", `typeof
+// crypto.DigestStream` is "function".
+type DigestStreamCtor = new (algorithm: string) =>
+  WritableStream<Uint8Array> & { digest: Promise<ArrayBuffer> };
+const DigestStream =
+  (crypto as unknown as { DigestStream: DigestStreamCtor }).DigestStream;
+
 // The CAS key IS the hash, so an artifact has to be hashed before it can be
 // stored — and Bioconductor publishes no checksum to hash against. Small ones
 // are buffered. Large ones are streamed twice: once through a DigestStream to
@@ -451,7 +461,10 @@ async function copySeedArtifact(
   if (!res.ok) return null;
   const len = Number(res.headers.get("content-length"));
 
-  if (!len || len <= SEED_BUFFER_MAX) {
+  // An unknown length takes the streaming path: buffering something that turns
+  // out to be a 346MB tarball kills the isolate, and streaming is safe at any
+  // size.
+  if (len && len <= SEED_BUFFER_MAX) {
     const body = await res.arrayBuffer();
     const sha256 = hex(await crypto.subtle.digest("SHA-256", body));
     const key = `prop/${universe}/cas/${sha256}`;
@@ -459,17 +472,21 @@ async function copySeedArtifact(
     return sha256;
   }
 
+  // Counted while digesting, so the second pass has an exact length even when
+  // the response carried no content-length.
+  let size = 0;
+  const counter = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, ctrl) { size += chunk.byteLength; ctrl.enqueue(chunk); },
+  });
   const digest = new DigestStream("SHA-256");
-  await res.body!.pipeTo(digest);
+  await res.body!.pipeThrough(counter).pipeTo(digest);
   const sha256 = hex(await digest.digest);
   const key = `prop/${universe}/cas/${sha256}`;
   if (await env.ARCHIVE.head(key)) return sha256;
 
   const second = await fetch(url);
   if (!second.ok || !second.body) return null;
-  const { readable, writable } = new FixedLengthStream(
-    Number(second.headers.get("content-length")) || len
-  );
+  const { readable, writable } = new FixedLengthStream(size);
   second.body.pipeTo(writable);
   await env.ARCHIVE.put(key, readable);
   return sha256;
