@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describe, findArtifact, gateFamily, metaOf, originOf, packagesDcf, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, viewsDcf } from "./repo.ts";
+import { describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -330,4 +330,116 @@ test("originOf: entries predating the field read as propagations", () => {
   assert.equal(originOf({}), "r-universe");
   assert.equal(originOf({ origin: "r-universe" }), "r-universe");
   assert.equal(originOf({ origin: "bioconductor" }), "bioconductor");
+});
+
+// ---------- seeding from the official Bioconductor repositories ----------
+
+test("parseDcf: stanzas, continuation lines, trailing record", () => {
+  const recs = parseDcf([
+    "Package: alpha",
+    "Version: 1.0.0",
+    "Description: one",
+    "    two",
+    "",
+    "Package: beta",
+    "Version: 2.0.0",
+  ].join("\n"));
+  assert.equal(recs.length, 2);
+  assert.equal(recs[0].Description, "one two");
+  assert.equal(recs[1].Package, "beta");   // final stanza without a trailing blank line
+});
+
+test("parseDcf: a value containing a colon keeps it", () => {
+  const [r] = parseDcf("Package: a\nURL: https://example.org/x\n");
+  assert.equal(r.URL, "https://example.org/x");
+});
+
+test("macArmDir tracks CRAN's rename at R 4.6", () => {
+  assert.equal(macArmDir("4.5"), "big-sur-arm64");
+  assert.equal(macArmDir("4.6"), "sonoma-arm64");
+  assert.equal(macArmDir("4.10"), "sonoma-arm64");  // not a float comparison
+});
+
+test("verGt compares numerically, part by part", () => {
+  assert.ok(verGt("1.10.0", "1.9.9"));       // not lexical
+  assert.ok(!verGt("1.2.0", "1.2.0"));       // equal is not greater: a seed needs a bump
+  assert.ok(!verGt("1.2.0", "1.2"));         // missing parts are zero, so these are equal
+  assert.ok(verGt("1.2.1", "1.2"));
+  assert.ok(verGt("1.2-1", "1.2-0"));
+});
+
+test("seedArtifacts: source always, binaries only where they exist", () => {
+  const only = seedArtifacts("edgeR", "4.10.1", "4.6", {});
+  assert.deepEqual(only.map((a) => a.os), ["src"]);
+  assert.equal(only[0].path, "src/contrib/edgeR_4.10.1.tar.gz");
+
+  const all = seedArtifacts("edgeR", "4.10.1", "4.6", { win: true, macArm: true, macX86: true });
+  assert.deepEqual(all.map((a) => `${a.os}/${a.arch ?? "-"}`),
+    ["src/-", "win/x86_64", "mac/arm64", "mac/x86_64"]);
+  assert.equal(all[1].path, "bin/windows/contrib/4.6/edgeR_4.10.1.zip");
+  assert.equal(all[2].path, "bin/macosx/sonoma-arm64/contrib/4.6/edgeR_4.10.1.tgz");
+  assert.equal(all[3].path, "bin/macosx/big-sur-x86_64/contrib/4.6/edgeR_4.10.1.tgz");
+  // Both mac builds share a filename and are told apart by arch alone.
+  assert.equal(all[2].file, all[3].file);
+});
+
+test("seeded artifacts resolve through the same selectors as propagated ones", () => {
+  const arts = seedArtifacts("edgeR", "4.10.1", "4.6", { win: true, macArm: true, macX86: true });
+  const idx = {
+    edgeR: {
+      version: "4.10.1", sha256: "s0", ts: "2026-08-14T00:00:00Z", origin: "bioconductor",
+      desc: { License: "GPL" }, artifacts: arts.map((a, i) => ({ ...a, sha256: "s" + i })),
+    },
+  };
+  const sha = (dir) => {
+    const sel = parseRepoDir(dir);
+    const f = packagesDcf(idx, sel).match(/^File: (.*)$/m)?.[1];
+    return f && findArtifact(idx, f, sel)?.sha256;
+  };
+  assert.equal(sha(["bin", "windows", "contrib", "4.6"]), "s1");
+  assert.equal(sha(["bin", "macosx", "sonoma-arm64", "contrib", "4.6"]), "s2");
+  assert.equal(sha(["bin", "macosx", "big-sur-x86_64", "contrib", "4.6"]), "s3");
+  assert.equal(sha(["src", "contrib"]), "s0");
+});
+
+test("seedDesc/seedMeta split a VIEWS stanza the way propagation does", () => {
+  const v = {
+    Package: "TPP", Version: "3.41.0",
+    Depends: "R (>= 3.4),\n  Biobase", Imports: "ggplot2", License: "Artistic-2.0",
+    NeedsCompilation: "no", Title: "Analyze TPP experiments",
+    Description: "A toolbox.", biocViews: "Software, Proteomics",
+    Maintainer: "Someone <s@example.org>",
+    vignettes: "vignettes/TPP/inst/doc/intro.html, vignettes/TPP/inst/doc/adv.html",
+    vignetteTitles: "Introduction, Advanced",
+    git_last_commit: "abc1234", git_last_commit_date: "2026-05-01",
+    // Fields the official VIEWS carries that we deliberately do not store.
+    dependencyCount: "88", hasREADME: "TRUE",
+  };
+  const d = seedDesc(v);
+  assert.equal(d.Depends, "R (>= 3.4), Biobase");   // folded, no bare newline in DCF
+  assert.equal(d.NeedsCompilation, "no");
+  assert.equal(d.Title, undefined);                 // Title is meta, not PACKAGES
+
+  const m = seedMeta(v);
+  assert.equal(m.Title, "Analyze TPP experiments");
+  assert.equal(m.biocViews, "Software, Proteomics");
+  assert.deepEqual(m.vignettes, [
+    { filename: "vignettes/TPP/inst/doc/intro.html", title: "Introduction" },
+    { filename: "vignettes/TPP/inst/doc/adv.html", title: "Advanced" },
+  ]);
+  assert.equal(m.commit.id, "abc1234");
+  assert.equal(m.dependencyCount, undefined);
+});
+
+test("a seeded commit date round-trips back through VIEWS unchanged", () => {
+  const m = seedMeta({ git_last_commit: "abc1234", git_last_commit_date: "2026-05-01" });
+  const dcf = viewsDcf({
+    TPP: {
+      version: "3.41.0", sha256: "s0", ts: "2026-08-14T00:00:00Z",
+      desc: { License: "Artistic-2.0" }, meta: m,
+      artifacts: [{ os: "src", r: "", sha256: "s0", file: "TPP_3.41.0.tar.gz" }],
+      origin: "bioconductor",
+    },
+  });
+  assert.match(dcf, /^git_last_commit_date: 2026-05-01$/m);
 });

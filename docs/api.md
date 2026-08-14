@@ -3,7 +3,7 @@
 Base URL: `https://bioc-registry.seandavi.workers.dev`
 
 Everything is read-only GET and unauthenticated, except the maintenance routes
-(`/poll`, `/backfill`, `/reindex`), which require an `x-maint-key` header
+(`/poll`, `/backfill`, `/reindex`, `/seed`), which require an `x-maint-key` header
 matching the `MAINT_KEY` worker secret when one is set. All data
 endpoints serve straight from the R2 bucket, so responses are exactly the
 stored objects — this API adds Range/CORS plumbing, not transformation.
@@ -77,8 +77,8 @@ secret present means the invocation is failing, not the token.
 
 Browsable API reference with a try-it panel for every route, rendered by Scalar
 from `/openapi.json`. The spec is hand-written in `src/openapi.ts` and covers the
-read-only surface only — `/poll`, `/backfill`, and `/reindex` are deliberately
-absent, since they are unauthenticated side-effecting GETs and a try-it button
+read-only surface only — `/poll`, `/backfill`, `/reindex` and `/seed` are
+deliberately absent, since they are unauthenticated side-effecting GETs and a try-it button
 next to `/backfill` is an invitation.
 
 Nothing generates the spec from the handlers, so **a route change is not finished
@@ -136,7 +136,10 @@ duckdb.sql("""
 ### `GET /repo/{universe}/…` — installable CRAN repo
 
 `install.packages(repos="https://bioc-registry.seandavi.workers.dev/repo/bioc")`.
-Generated from the propagation index; only propagated packages appear.
+Generated from the propagation index, so a package appears here only once it is
+in that index — either by passing the gate or by being seeded from
+Bioconductor's own release build (`/seed` below). The entry's `origin` says
+which; both are installable the same way.
 
 - `src/contrib/PACKAGES` (and `.gz`) — source index, `write_PACKAGES()` fields
   only. No `PACKAGES.rds`, no `MD5sum` (r-universe exposes sha256 only).
@@ -178,6 +181,37 @@ idempotent; `run=N` salts the instance id so a relaunch isn't blocked by a
 previous errored instance. Use after a gate change to re-evaluate the current
 state without waiting for the next upstream change.
 
+### `GET /seed?universe={bioc|bioc-release}&start=N&refresh=1`
+
+Maintenance. One-time backfill of packages the official Bioconductor repositories
+ship that have never passed this gate — they build in BBS and fail in
+r-universe's environment, usually because an example reaches an external service
+the runner cannot get to. Requires `x-maint-key`.
+
+Strictly additive: it only fills holes. A package already in the index keeps its
+entry, whatever its origin, so a `/seed` run can never displace or block a
+propagated package. The version gate is untouched — a seeded package is replaced
+the ordinary way, when its maintainer bumps the version and r-universe builds it.
+
+Seeded entries carry `"origin": "bioconductor"`, an empty `archs`, and a null
+`bioccheck`, because they never faced the gate.
+
+The first call (per universe) builds a plan from the official `VIEWS` plus the
+Windows and both macOS `PACKAGES` files, and stores it at
+`prop/{universe}/seed/plan.json`; later calls read the plan instead of re-fetching
+~8MB. `refresh=1` discards it, which is what a new Bioconductor release needs.
+
+Ten packages per call, walking with `start=N`, same as `/backfill`:
+
+```
+bioc-release: seeded 10, 34 artifacts copied, 6 artifacts missing upstream — next start=10 of 163
+bioc-release: seed complete (163 planned)
+```
+
+Binaries come only from the binary directory's own `PACKAGES` at a matching
+version — the counts differ from source (release: 2384 source, 2305 Windows,
+2332 arm64, 2361 Intel), so a binary is never assumed to exist.
+
 ## Storage keys
 
 All addressable through `/data/<key>`.
@@ -195,6 +229,7 @@ All addressable through `/data/<key>`.
 | `prop/{universe}/index.json` | `{ [package]: {version, sha256, ts, bioccheck, artifacts[], desc, meta, archs} }` — the propagated set |
 | `prop/{universe}/cas/{sha256}` | artifact bytes (source tarball or platform binary), keyed by content hash |
 | `prop/{universe}/pending/{digest12}.json` | gate output for one observation: array of candidates |
+| `prop/{universe}/seed/plan.json` | what a `/seed` run intends to seed: package, version, desc, meta, artifact paths |
 | `prop/{universe}/log/{ts}-{pkg}_{ver}.json` | propagation ledger entry |
 
 `{universe}` is `bioc` (devel) or `bioc-release`. `{digest12}` is the first 12
