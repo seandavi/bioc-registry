@@ -276,7 +276,8 @@ so globbing with or without `hive_partitioning` both work.
       "vignettes": [{ "filename": "edgeR.html", "title": "edgeR vignette" }],
       "commit": { "id": "fe0a5fe…", "time": 1786329705 }
     },
-    "archs": ["linux", "win", "mac"]
+    "archs": ["linux", "win", "mac"],
+    "origin": "r-universe"
   }
 }
 ```
@@ -287,3 +288,10 @@ carried these fields lack them until `/reindex` runs after a fresh poll.
 
 `bioccheck` is the advisory BiocCheck verdict at propagation time — recorded,
 never gating. Each artifact's bytes are at `prop/{universe}/cas/{sha256}`.
+
+`origin` says where the entry came from: `r-universe` for anything that passed
+the gate, `bioconductor` for an entry seeded from Bioconductor's own release
+build. A seeded entry has an empty `archs` and a null `bioccheck` because it
+never faced this gate at all — without `origin` it would be indistinguishable
+from a gate verdict that was never made. Entries written before the field
+existed are propagations and read as `r-universe`.

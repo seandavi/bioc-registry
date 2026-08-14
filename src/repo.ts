@@ -46,7 +46,17 @@ export type PropIndex = Record<string, {
   // per-arch gating lack it). Families absent here are "not available": their
   // binaries were not propagated.
   archs?: string[];
+  // Where the entry came from. A "bioconductor" entry was seeded from
+  // Bioconductor's own release build and never passed this gate — its archs is
+  // empty and its bioccheck is null, so without this field it would be
+  // indistinguishable from a gate verdict we never made.
+  origin?: Origin;
 }>;
+
+export type Origin = "r-universe" | "bioconductor";
+
+// Entries predating the field are propagations, which is what they are.
+export const originOf = (e: { origin?: Origin }): Origin => e.origin ?? "r-universe";
 
 export type Sel = { os: string; r?: string; arch?: string; distro?: string };
 
