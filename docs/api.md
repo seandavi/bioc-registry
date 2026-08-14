@@ -12,9 +12,12 @@ stored objects — this API adds Range/CORS plumbing, not transformation.
 
 ### `GET /`
 
-Human dashboard (server-rendered HTML). Per universe: stat tiles (packages,
-failing, last change, observations, propagated) and a config × check-status
-table from the latest observation.
+Human dashboard (server-rendered HTML). Per universe: stat tiles (packages, not
+propagated, last change, observations, propagated, and — when any exist — seeded
+from Bioconductor) and a config × check-status table from the latest observation.
+Propagated and seeded are counted separately: a seeded package never passed the
+gate, so folding the two together would improve the propagation rate by ~300
+without a single package earning it.
 
 ### `GET /pkg/{universe}/{package}`
 
@@ -22,7 +25,9 @@ Package page (server-rendered HTML + client-side history). Shows, for the
 latest observation: version, build status, per-config job table (check status,
 R version, wall time, links to the log proxy and the GHA job page), a
 newer-commit-failed banner when `_failure` is set, and the propagation index
-entry (propagated version, artifacts with download links). The history section
+entry (propagated version, artifacts with download links, source repo, and —
+for a seeded entry — a banner saying it came from Bioconductor's release build
+rather than this gate). The history section
 loads DuckDB-WASM in the browser and pivots the package's rows from every
 parquet observation into an observation × config check-status table.
 404 if the package is not in the latest observation.
@@ -147,8 +152,8 @@ which; both are installable the same way.
   fields plus Title/Description/biocViews/Author/Maintainer/URL/BugReports/
   SystemRequirements/VignetteBuilder/Date, `git_last_commit{,_date}`,
   `source.ver`/`win.binary.ver`/`mac.binary.ver`, `vignettes`/`vignetteTitles`,
-  and reverse deps within the propagated set (`dependsOnMe`, `importsMe`,
-  `suggestsMe`). Omitted as unknowable here: MD5sum, Rank, dependencyCount,
+  `git_url`, and reverse deps within the propagated set (`dependsOnMe`,
+  `importsMe`, `suggestsMe`). Omitted as unknowable here: MD5sum, Rank, dependencyCount,
   hasREADME/hasNEWS/hasINSTALL/hasLICENSE, Rfiles, htmlDocs, htmlTitles.
 - `src/contrib/{pkg}_{ver}.tar.gz`, `bin/windows/contrib/{r}/{file}`,
   `bin/macosx/{arch}/contrib/{r}/{file}` — artifact bytes from the CAS.
@@ -309,7 +314,8 @@ so globbing with or without `hive_partitioning` both work.
       "biocViews": "GeneExpression, DifferentialExpression, …",
       "Maintainer": "Yunshun Chen <yuchen@wehi.edu.au>",
       "vignettes": [{ "filename": "edgeR.html", "title": "edgeR vignette" }],
-      "commit": { "id": "fe0a5fe…", "time": 1786329705 }
+      "commit": { "id": "fe0a5fe…", "time": 1786329705 },
+      "git_url": "https://github.com/bioc/edgeR"
     },
     "archs": ["linux", "win", "mac"],
     "origin": "r-universe"
@@ -323,6 +329,13 @@ carried these fields lack them until `/reindex` runs after a fresh poll.
 
 `bioccheck` is the advisory BiocCheck verdict at propagation time — recorded,
 never gating. Each artifact's bytes are at `prop/{universe}/cas/{sha256}`.
+
+`meta.git_url` is where the package's source is built from, taken from the
+universe's own `.gitmodules` (or the official VIEWS for a seeded entry). For a
+Bioconductor package this is a `github.com/bioc/*` **read-only mirror** of
+`git.bioconductor.org`, or that git server itself — never a maintainer's
+development repo, so it is not somewhere a pull request can go. It is filled on
+propagation, on seeding, and for existing entries by `/reindex`.
 
 `origin` says where the entry came from: `r-universe` for anything that passed
 the gate, `bioconductor` for an entry seeded from Bioconductor's own release

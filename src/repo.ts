@@ -25,6 +25,12 @@ export const META_FIELDS = [
 export type Meta = Partial<Record<(typeof META_FIELDS)[number], string>> & {
   vignettes?: { filename?: string; title?: string }[];
   commit?: { id?: string; time?: number };
+  // Where the package's source is built from, per the universe's .gitmodules or
+  // the official VIEWS. For a Bioconductor package this is a github.com/bioc/*
+  // READ-ONLY MIRROR of git.bioconductor.org, or that git server itself — never
+  // a maintainer's development repo. Anything acting on it must not treat it as
+  // a place to send a pull request.
+  git_url?: string;
 };
 
 export function metaOf(p: Partial<Record<(typeof META_FIELDS)[number], string>> & {
@@ -273,6 +279,7 @@ export function viewsDcf(idx: PropIndex): string {
       SystemRequirements: m.SystemRequirements,
       VignetteBuilder: m.VignetteBuilder,
       Date: m.Date,
+      git_url: m.git_url,
       git_last_commit: m.commit?.id,
       git_last_commit_date: m.commit?.time
         ? new Date(m.commit.time * 1000).toISOString().slice(0, 10)
@@ -373,6 +380,7 @@ const csv = (s?: string) => (s ?? "").split(",").map((x) => x.trim()).filter(Boo
 export function seedMeta(v: Record<string, string>): Meta {
   const m: Meta = {};
   for (const k of META_FIELDS) if (v[k]) m[k] = v[k];
+  if (v.git_url) m.git_url = v.git_url;
   const files = csv(v.vignettes), titles = csv(v.vignetteTitles);
   if (files.length) m.vignettes = files.map((f, i) => ({ filename: f, title: titles[i] }));
   // The official VIEWS dates the commit but does not stamp it; midnight UTC of
@@ -385,6 +393,24 @@ export function seedMeta(v: Record<string, string>): Meta {
         : undefined,
     };
   return m;
+}
+
+// Each universe is a GitHub repo holding one git submodule per package, so
+// .gitmodules is the authoritative package -> source repo map: one fetch covers
+// every package in the universe, including ones that never propagated. Keyed by
+// submodule path, which is the package name.
+export function parseGitmodules(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let path = "";
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.startsWith("[submodule")) { path = ""; continue; }
+    const m = /^(path|url) = (.+)$/.exec(t);
+    if (!m) continue;
+    if (m[1] === "path") path = m[2];
+    else if (path) out[path] = m[2];
+  }
+  return out;
 }
 
 export type SeedArtifact = { os: string; r: string; arch?: string; path: string; file: string };
