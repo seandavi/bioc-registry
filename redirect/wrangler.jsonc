@@ -1,0 +1,6 @@
+// Deploys over the retired bioc-prop worker: same name, nothing but a 301.
+{
+  "name": "bioc-prop",
+  "main": "index.ts",
+  "compatibility_date": "2026-08-01"
+}
