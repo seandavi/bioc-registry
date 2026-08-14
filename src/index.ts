@@ -1,0 +1,1133 @@
+import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from "cloudflare:workers";
+import { parquetWriteBuffer } from "hyparquet-writer";
+import { parquetReadObjects } from "hyparquet";
+import {
+  Artifact, Desc, Family, Meta, PropIndex, PKG_EXT,
+  describe, findArtifact, metaOf, packagesDcf, parseRepoDir, passingFamilies,
+  pendingJobIds, planCompaction, mergeRows, viewsDcf, JobRow, RowState,
+} from "./repo.js";
+import { DOCS_PAGE, OPENAPI } from "./openapi.js";
+
+const UNIVERSES = ["bioc", "bioc-release"];
+// Build-relevant fields only: full body is ~70MB and includes volatile fields
+// (_score, _stars) that would make the digest churn on every poll.
+// _failure: when a newer commit fails, the main record keeps showing the last
+// successful build — the failure is ONLY visible in this field.
+// The unprefixed fields ARE the parsed DESCRIPTION and feed PACKAGES directly —
+// except the dependency fields, which r-universe normalises out of the top level
+// into _dependencies [{package, version, role}]. Priority/OS_type are usually
+// absent (only set when the DESCRIPTION sets them); requesting them is harmless.
+// NB: adding fields changes the digest, so the first poll after this re-archives
+// and re-fires every universe once.
+const FIELDS =
+  "Version,License,NeedsCompilation,Priority,OS_type,_dependencies,_file," +
+  "_sha256,_status,_jobs,_created,_expires,_fileid,_binaries,_commit,_failure,_buildurl," +
+  // Descriptive metadata for VIEWS and the site's landing pages. All of these
+  // change only when the package itself changes, so the digest stays quiet.
+  "Title,Description,Author,Maintainer,URL,BugReports,SystemRequirements,Date," +
+  "biocViews,VignetteBuilder,_vignettes";
+
+export interface Env {
+  ARCHIVE: R2Bucket;
+  OBSERVE: Workflow;
+  // Secret. Required in the x-maint-key header by /poll, /reindex and
+  // /backfill when set; leave unset locally to keep dev friction at zero.
+  MAINT_KEY?: string;
+  // Secret. GHA job-log downloads 403 without auth (job *metadata* is public; only
+  // the log body needs a token). Used by captureLogs on the cron path ONLY — never
+  // on a public route, so an incoming request can't drive it against GitHub.
+  GITHUB_TOKEN?: string;
+}
+
+async function poll(universe: string, env: Env): Promise<string> {
+  const res = await fetch(
+    `https://${universe}.r-universe.dev/api/packages?limit=100000&fields=${FIELDS}`
+  );
+  if (!res.ok) throw new Error(`${universe}: HTTP ${res.status}`);
+  const body = await res.arrayBuffer();
+  const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  const last = await env.ARCHIVE.get(`state/${universe}/latest`);
+  if (last && (await last.json<{ digest: string }>()).digest === digest) {
+    return `${universe}: unchanged ${digest.slice(0, 12)}`;
+  }
+
+  const ts = new Date().toISOString();
+  const key = `obs/${universe}/dt=${ts.slice(0, 10)}/${ts}-${digest.slice(0, 12)}.json`;
+  await env.ARCHIVE.put(key, body);
+  await env.ARCHIVE.put(`state/${universe}/latest`, JSON.stringify({ digest, key, ts }));
+
+  try {
+    // Digest-as-ID: exactly one workflow instance per distinct upstream state.
+    await env.OBSERVE.create({
+      id: `${universe}-${digest.slice(0, 32)}`,
+      params: { universe, key, digest, ts },
+    });
+  } catch (e) {
+    // Duplicate instance (digest reverted to a previously seen state) — already reacted.
+    if (!String(e).includes("already exists")) throw e;
+  }
+  return `${universe}: archived ${key}`;
+}
+
+// ---------- log capture ----------
+// GHA deletes job logs at ~90 days, which makes them the second unrecoverable
+// thing here after the artifacts. Capture runs on the cron and walks forward from
+// a stored high-water mark; see pendingJobIds for why one integer is enough state.
+// 50/run against a 15-minute cron is 4,800/day, comfortably over the ~1.5k/day of
+// new job ids observed per universe and well under GitHub's 5,000/hr for a token.
+const LOGS_PER_RUN = 50;
+
+async function captureLogs(universe: string, env: Env): Promise<string> {
+  if (!env.GITHUB_TOKEN) return `${universe}: capture skipped (no GITHUB_TOKEN)`;
+  const last = await env.ARCHIVE.get(`state/${universe}/latest`);
+  if (!last) return `${universe}: capture skipped (no observation yet)`;
+  const { key } = await last.json<{ key: string }>();
+  const obs = await env.ARCHIVE.get(key);
+  if (!obs) return `${universe}: capture skipped (${key} missing)`;
+
+  const cur = await env.ARCHIVE.get(`state/${universe}/logcursor`);
+  const cursor = cur ? (await cur.json<{ job: number }>()).job : 0;
+  const ids = pendingJobIds(await obs.json(), cursor, LOGS_PER_RUN);
+  if (!ids.length) return `${universe}: logs current at ${cursor}`;
+
+  let mark = cursor;
+  let saved = 0;
+  for (const job of ids) {
+    const gh = await fetch(
+      `https://api.github.com/repos/r-universe/${universe}/actions/jobs/${job}/logs`,
+      { headers: { "user-agent": "bioc-registry", authorization: `Bearer ${env.GITHUB_TOKEN}` } }
+    );
+    // Out of budget: stop without advancing, so these ids are retried next run.
+    if (gh.status === 403 && gh.headers.get("x-ratelimit-remaining") === "0") break;
+    // Anything else terminal (404/410 = already expired upstream) is unrecoverable,
+    // so let the mark pass it rather than wedging the cursor on a dead job.
+    if (gh.ok) {
+      await env.ARCHIVE.put(`logs/${universe}/${job}.txt`, await gh.arrayBuffer());
+      saved++;
+    }
+    mark = job;
+  }
+  if (mark > cursor) await env.ARCHIVE.put(`state/${universe}/logcursor`, JSON.stringify({ job: mark }));
+  return `${universe}: captured ${saved}/${ids.length} logs, cursor ${mark}`;
+}
+
+// Capture is best-effort: a GitHub outage must not fail the poll it rides with,
+// and the cursor means the skipped ids are simply picked up next run.
+const capture = (env: Env) =>
+  UNIVERSES.map((u) => captureLogs(u, env).catch((e) => `${u}: capture failed: ${e}`));
+
+// ---------- parquet ----------
+
+// One schema, shared by the per-observation writer and the compactor so a column
+// added to one cannot go missing from the other.
+const PQ_COLS = [
+  "universe", "obs_ts", "package", "version", "sha256", "created", "expires",
+  "config", "r", "check", "time", "job", "artifact", "deleted",
+] as const;
+type PqCol = (typeof PQ_COLS)[number];
+
+const parquetBuf = (col: Record<PqCol, unknown[]>) =>
+  parquetWriteBuffer({
+    columnData: PQ_COLS.map((name) => ({
+      name,
+      data: col[name],
+      type: name === "time" || name === "deleted" ? "INT32" : name === "job" ? "INT64" : "STRING",
+    })),
+  });
+
+// obs/bioc/dt=2026-08-08/2026-08-08T19:01:50.388Z-acd8dfc2015f.json
+//   -> parquet/jobs/universe=bioc/dt=2026-08-08/2026-08-08T19:01:50.388Z-acd8dfc2015f.parquet
+const parquetKeyFor = (obsKey: string) =>
+  obsKey
+    .replace(/^obs\/([^/]+)\//, "parquet/jobs/universe=$1/")
+    .replace(/\.json$/, ".parquet");
+
+async function writeJobsParquet(env: Env, obsKey: string): Promise<string> {
+  const pqKey = parquetKeyFor(obsKey);
+  if (await env.ARCHIVE.head(pqKey)) return `exists ${pqKey}`;
+  const obs = await env.ARCHIVE.get(obsKey);
+  if (!obs) throw new Error(`missing observation ${obsKey}`);
+  const pkgs = await obs.json<FullPkg[]>();
+  const universe = obsKey.split("/")[1];
+  const obsTs = obsKey.split("/").pop()!.slice(0, 24);
+
+  const rows: JobRow[] = [];
+  for (const p of pkgs) {
+    for (const j of p._jobs ?? []) {
+      rows.push({
+        package: p.Package, config: j.config,
+        version: p.Version ?? null, sha256: p._sha256 ?? null,
+        created: p._created ?? null, expires: p._expires ?? null,
+        r: j.r ?? null, check: j.check ?? null, time: j.time ?? null,
+        job: j.job != null ? BigInt(j.job) : null, artifact: j.artifact || null,
+      });
+    }
+  }
+
+  // Only observations newer than the state may advance it. /backfill and workflow
+  // retries can hand us an older one, and diffing that against a future state
+  // would record changes that never happened — so those write a full snapshot,
+  // which is redundant but correct for a carry-forward reader.
+  const st = await env.ARCHIVE.get(`state/${universe}/rowstate`);
+  const prev = st ? await st.json<{ ts: string; rows: RowState }>() : null;
+  const inOrder = !prev || obsTs > prev.ts;
+  const { changed, state } = inOrder
+    ? mergeRows(prev?.rows ?? {}, rows)
+    : { changed: rows, state: null };
+
+  const col = {} as Record<PqCol, unknown[]>;
+  for (const n of PQ_COLS) col[n] = [];
+  for (const r of changed) {
+    col.universe.push(universe); col.obs_ts.push(obsTs); col.package.push(r.package);
+    col.version.push(r.version); col.sha256.push(r.sha256);
+    col.created.push(r.created); col.expires.push(r.expires);
+    col.config.push(r.config); col.r.push(r.r); col.check.push(r.check);
+    col.time.push(r.time); col.job.push(r.job); col.artifact.push(r.artifact);
+    col.deleted.push(r.deleted ?? null);
+  }
+  // Parquet before state: a crash in between leaves the state stale, so the retry
+  // recomputes the same delta and rewrites the same key. State first would lose
+  // the rows entirely.
+  await env.ARCHIVE.put(pqKey, parquetBuf(col));
+  if (state) await env.ARCHIVE.put(`state/${universe}/rowstate`, JSON.stringify({ ts: obsTs, rows: state }));
+  // A zero-change observation writes no rows, so without this list it leaves no
+  // trace and a reader cannot tell "not observed" from "nothing changed".
+  // ponytail: rewrites a growing array each time — ~350KB after a year at 40/day,
+  // so the O(n) rewrite is cheaper than any structure that avoids it.
+  const seen = await env.ARCHIVE.get(`state/${universe}/observations.json`);
+  const all = new Set(seen ? await seen.json<string[]>() : []);
+  all.add(obsTs);
+  await env.ARCHIVE.put(
+    `state/${universe}/observations.json`,
+    JSON.stringify([...all].sort()),
+    { httpMetadata: { contentType: "application/json" } }
+  );
+  return `wrote ${pqKey} (${changed.length}/${rows.length} rows${inOrder ? "" : ", full: out of order"})`;
+}
+
+// ---------- compaction ----------
+// One parquet per observation means DuckDB opens every file before it reads a
+// row — 200+ already, climbing ~40/day, at roughly 3 range requests each. Merging
+// each closed day down to one file per universe holds that at 2/day.
+//
+// ponytail: merges a bounded slice per cron run rather than a whole day at once.
+// The bound is bytes: file count is a bad proxy once merged files exist, and six
+// of those decoded to ~560k rows and killed the Worker (1102), stalling poll and
+// capture with it. ~3MB is ~120k rows. Note this
+// only shrinks file COUNT — every observation is a full snapshot differing from
+// the last by ~600 job ids, so the real win is writing changed rows only, which
+// costs the pivot queries a carry-forward.
+const COMPACT_MAX_BYTES = 3_000_000;
+
+async function compactParquet(universe: string, env: Env): Promise<string> {
+  const prefix = `parquet/jobs/universe=${universe}/`;
+  // ponytail: one page is ~500 days once compaction is caught up, and the oldest
+  // day sorts first regardless. Paginate if that ever stops being true.
+  const list = await env.ARCHIVE.list({ prefix, limit: 1000 });
+  const plan = planCompaction(
+    list.objects.map((o) => ({ key: o.key, size: o.size })),
+    new Date().toISOString().slice(0, 10),
+    COMPACT_MAX_BYTES
+  );
+  if (!plan) return `${universe}: nothing to compact`;
+
+  const col = {} as Record<PqCol, unknown[]>;
+  for (const n of PQ_COLS) col[n] = [];
+  for (const key of plan.sources) {
+    const obj = await env.ARCHIVE.get(key);
+    if (!obj) continue;
+    for (const row of await parquetReadObjects({ file: await obj.arrayBuffer() }))
+      for (const n of PQ_COLS) col[n].push((row as Record<string, unknown>)[n] ?? null);
+  }
+  await env.ARCHIVE.put(plan.out, parquetBuf(col));
+  // The output can be one of the sources when the oldest was already a merge; it
+  // has just been rewritten as a superset, so deleting it here would lose data.
+  const drop = plan.sources.filter((k) => k !== plan.out);
+  if (drop.length) await env.ARCHIVE.delete(drop);
+  return `${universe}: merged ${plan.sources.length} files of ${plan.day} into ${plan.out} (${col.package.length} rows)`;
+}
+
+const compact = (env: Env) =>
+  UNIVERSES.map((u) => compactParquet(u, env).catch((e) => `${u}: compaction failed: ${e}`));
+
+// ---------- propagation ----------
+// Gate: build succeeded, and checks pass on AT LEAST ONE architecture (linux,
+// mac, windows) — per-family verdicts from the BBS-equivalent gating jobs, see
+// passingFamilies() in repo.ts. Only the passing families' binaries propagate;
+// the rest are simply not available. The source tarball always propagates with
+// an eligible package. Which R line gates shifts with the R release cycle, so
+// it is resolved from bioconductor.org/config.yaml (r_ver_for_bioc_ver) at
+// evaluate time, and jobs are matched on their actual R version — not on
+// config-name labels. bioc-checks (BiocCheck), wasm, other R lines and
+// off-gate chips are advisory: tracked, never blocking; the BiocCheck verdict
+// is recorded in the index.
+async function gatingRMinor(universe: string): Promise<string> {
+  const res = await fetch("https://bioconductor.org/config.yaml");
+  if (!res.ok) throw new Error(`config.yaml: HTTP ${res.status}`);
+  const y = await res.text();
+  const branch = universe === "bioc" ? "devel" : "release";
+  const biocVer = y.match(new RegExp(`^${branch}_version: "([\\d.]+)"`, "m"))?.[1];
+  const rMinor =
+    biocVer && y.split("r_ver_for_bioc_ver:")[1]?.match(new RegExp(`"${biocVer}": "(\\d+\\.\\d+)"`))?.[1];
+  if (!rMinor) throw new Error(`cannot resolve gating R version for ${universe} (bioc ${biocVer})`);
+  return rMinor;
+}
+
+const R_VER = /^\d+([.-]\d+)*$/;
+const BATCH = 20;
+
+function verGt(a: string, b: string): boolean {
+  const pa = a.split(/[.-]/).map(Number), pb = b.split(/[.-]/).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d) return d > 0;
+  }
+  return false;
+}
+
+type Candidate = {
+  package: string; version: string; sha256: string;
+  bioccheck: string | null; artifacts: Artifact[]; desc: Desc; meta: Meta;
+  archs: Family[];
+};
+
+async function readIndex(env: Env, universe: string): Promise<PropIndex> {
+  const o = await env.ARCHIVE.get(`prop/${universe}/index.json`);
+  return o ? await o.json<PropIndex>() : {};
+}
+
+async function evaluate(env: Env, universe: string, obsKey: string, digest: string) {
+  const obs = await env.ARCHIVE.get(obsKey);
+  if (!obs) throw new Error(`missing observation ${obsKey}`);
+  const pkgs = await obs.json<FullPkg[]>();
+  const idx = await readIndex(env, universe);
+  const rMinor = await gatingRMinor(universe);
+  const candidates: Candidate[] = [];
+  for (const p of pkgs) {
+    const jobs = p._jobs ?? [];
+    if (p._status !== "success" || !jobs.length) continue;
+    const archs = passingFamilies(jobs, rMinor);
+    if (!archs.length) continue;
+    if (!p.Version || !R_VER.test(p.Version) || !p._sha256) continue;
+    const prev = idx[p.Package];
+    // Version must be a strict bump over the previously propagated version.
+    if (prev && !verGt(p.Version, prev.version)) continue;
+    const artifacts: Artifact[] = [
+      // Source always rides with an eligible package; binaries only for the
+      // families whose checks passed. wasm has no gating job, so it stays
+      // advisory and rides along like before.
+      {
+        os: "src", r: "", sha256: p._sha256,
+        file: p._file || `${p.Package}_${p.Version}.tar.gz`,
+      },
+      ...(p._binaries ?? [])
+        .filter((b) => b.status === "success" && b.fileid && b.version === p.Version)
+        .filter((b) => b.os === "wasm" || archs.includes(b.os as Family))
+        .map((b) => ({
+          os: b.os, r: b.r ?? "", sha256: b.fileid!.split("/").pop()!,
+          arch: b.arch, distro: b.distro,
+          file: `${p.Package}_${p.Version}.${PKG_EXT[b.os] ?? "tar.gz"}`,
+        })),
+    ];
+    candidates.push({
+      package: p.Package, version: p.Version, sha256: p._sha256,
+      bioccheck: jobs.find((j) => j.config === "bioc-checks")?.check ?? null,
+      artifacts,
+      desc: describe(p),
+      meta: metaOf(p),
+      archs,
+    });
+  }
+  const pendingKey = `prop/${universe}/pending/${digest.slice(0, 12)}.json`;
+  await env.ARCHIVE.put(pendingKey, JSON.stringify(candidates));
+  return { pendingKey, count: candidates.length };
+}
+
+async function copyCas(env: Env, universe: string, sha256: string): Promise<boolean> {
+  const key = `prop/${universe}/cas/${sha256}`;
+  if (await env.ARCHIVE.head(key)) return false;
+  const res = await fetch(`https://r2.ropensci.org/${sha256}`);
+  if (!res.ok) throw new Error(`fetch ${sha256}: HTTP ${res.status}`);
+  const len = Number(res.headers.get("content-length"));
+  if (res.body && len) {
+    const { readable, writable } = new FixedLengthStream(len);
+    res.body.pipeTo(writable);
+    await env.ARCHIVE.put(key, readable);
+  } else {
+    await env.ARCHIVE.put(key, await res.arrayBuffer());
+  }
+  return true;
+}
+
+async function propagateBatch(env: Env, universe: string, pendingKey: string, start: number) {
+  const pending = await env.ARCHIVE.get(pendingKey);
+  if (!pending) throw new Error(`missing ${pendingKey}`);
+  const batch = (await pending.json<Candidate[]>()).slice(start, start + BATCH);
+  const ts = new Date().toISOString();
+  let copied = 0;
+  for (const c of batch) {
+    // 3 concurrent copies = 6 connections, the per-invocation cap
+    const shas = c.artifacts.map((a) => a.sha256);
+    for (let i = 0; i < shas.length; i += 3) {
+      const done = await Promise.all(shas.slice(i, i + 3).map((s) => copyCas(env, universe, s)));
+      copied += done.filter(Boolean).length;
+    }
+    await env.ARCHIVE.put(
+      `prop/${universe}/log/${ts}-${c.package}_${c.version}.json`,
+      JSON.stringify({ ...c, ts })
+    );
+  }
+  // ponytail: read-modify-write; concurrent same-universe instances could clobber an
+  // entry, but copies are idempotent and the next wave re-converges the index.
+  const idx = await readIndex(env, universe);
+  for (const c of batch)
+    idx[c.package] = {
+      version: c.version, sha256: c.sha256, ts,
+      bioccheck: c.bioccheck, artifacts: c.artifacts, desc: c.desc, meta: c.meta,
+      archs: c.archs,
+    };
+  await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
+  return { start, packages: batch.length, copied };
+}
+
+// ---------- CRAN-layout repo ----------
+
+// Fills desc/file on index entries written before those were recorded, using the
+// latest observation. Entries whose propagated version no longer matches upstream
+// are left alone: their DESCRIPTION is gone from the API and guessing it would put
+// the wrong dependencies in PACKAGES. Those re-enter on their next propagation.
+async function reindex(universe: string, env: Env): Promise<string> {
+  const last = await env.ARCHIVE.get(`state/${universe}/latest`);
+  if (!last) return `${universe}: no observations`;
+  const meta = await last.json<{ key: string }>();
+  const obs = await env.ARCHIVE.get(meta.key);
+  if (!obs) return `${universe}: missing ${meta.key}`;
+  const byName = new Map((await obs.json<FullPkg[]>()).map((p) => [p.Package, p]));
+  const idx = await readIndex(env, universe);
+  let renamed = 0, desc = 0, stale = 0, nodesc = 0;
+  for (const [name, e] of Object.entries(idx)) {
+    const p = byName.get(name);
+    // Binaries are only described by the observation while it still reports the
+    // version we propagated; a rebuild changes the sha256 and the match is lost.
+    const current = p && p.Version === e.version ? p : undefined;
+    const bins = new Map(
+      (current?._binaries ?? []).filter((b) => b.fileid).map((b) => [b.fileid!.split("/").pop()!, b])
+    );
+    for (const a of e.artifacts) {
+      // Recomputed unconditionally rather than filled-if-missing: an earlier
+      // release named every binary .tar.gz, having assumed _binaries[].os was
+      // "windows"/"macos" when it is really "win"/"mac".
+      const want = a.os === "src" && current?._file
+        ? current._file
+        : `${name}_${e.version}.${PKG_EXT[a.os] ?? "tar.gz"}`;
+      if (a.file !== want) { a.file = want; renamed++; }
+      a.arch ??= bins.get(a.sha256)?.arch;
+    }
+    if (!current) { stale++; continue; }
+    const d = describe(current);
+    // An observation archived before FIELDS carried the DESCRIPTION yields {}.
+    // Leave desc unset so this entry stays out of PACKAGES and a later reindex
+    // (after a fresh poll) retries it, rather than freezing in a bare state.
+    if (Object.keys(d).length) { e.desc = d; desc++; } else nodesc++;
+    // Same rule for the descriptive metadata (VIEWS/landing pages): only set
+    // from an observation that actually carried the fields.
+    const m = metaOf(current);
+    if (Object.keys(m).length) e.meta = m;
+  }
+  await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
+  return `${universe}: described ${desc}, renamed ${renamed}, stale ${stale}, ` +
+    `no-description-in-observation ${nodesc}, total ${Object.keys(idx).length}`;
+}
+
+// ---------- dashboard ----------
+
+type FullPkg = {
+  Package: string; Version?: string; _sha256?: string; _created?: string; _expires?: string;
+  _status?: string;
+  License?: string; NeedsCompilation?: string; Priority?: string; OS_type?: string;
+  Title?: string; Description?: string; Author?: string; Maintainer?: string;
+  URL?: string; BugReports?: string; SystemRequirements?: string; Date?: string;
+  biocViews?: string; VignetteBuilder?: string;
+  _vignettes?: { filename?: string; title?: string }[];
+  _commit?: { id?: string; time?: number };
+  _file?: string;
+  _dependencies?: { package: string; version?: string; role: string }[];
+  _binaries?: {
+    r?: string; os: string; version?: string; fileid?: string; status?: string;
+    arch?: string; distro?: string;
+  }[];
+  _jobs?: { job?: number; config: string; r?: string; check?: string; time?: number; artifact?: string }[];
+  _failure?: { version?: string; commit?: { id?: string; time?: number }; buildurl?: string };
+  // The workflow run that _jobs came from. Needed to link a job on github.com,
+  // which has no URL form that takes a job id alone.
+  _buildurl?: string;
+};
+type Pkg = { Package: string; _jobs?: { config: string; check: string }[] };
+
+type Summary = {
+  universe: string;
+  ts: string;
+  digest: string;
+  packages: number;
+  notPropagated: string[];
+  configs: Record<string, Record<string, number>>;
+  recentObs: { key: string; size: number }[];
+  obsCount: string;
+  propagated: number;
+  rMinor: string;
+};
+
+async function summarize(universe: string, env: Env): Promise<Summary | null> {
+  const last = await env.ARCHIVE.get(`state/${universe}/latest`);
+  if (!last) return null;
+  const meta = await last.json<{ digest: string; key: string; ts: string }>();
+  const obs = await env.ARCHIVE.get(meta.key);
+  if (!obs) return null;
+  const pkgs = await obs.json<Pkg[]>();
+
+  const configs: Record<string, Record<string, number>> = {};
+  for (const p of pkgs) {
+    for (const j of p._jobs ?? []) {
+      const c = (configs[j.config] ??= {});
+      c[j.check] = (c[j.check] ?? 0) + 1;
+    }
+  }
+  // ponytail: single list call, caps at 1000 observations; paginate when we get there
+  const list = await env.ARCHIVE.list({ prefix: `obs/${universe}/`, limit: 1000 });
+  // Counting packages with ANY ERROR/FAILURE job contradicted the gate: it was
+  // dominated by bioc-checks, which the gate treats as advisory (BBS policy). What
+  // actually matters is which observed packages never made it into the index — a
+  // set difference, not a subtraction, so index entries for packages that have left
+  // the universe cannot make the count go negative.
+  const idx = await readIndex(env, universe);
+  const notPropagated = pkgs.map((p) => p.Package).filter((n) => !idx[n]).sort();
+  const propagated = Object.keys(idx).length;
+  return {
+    universe,
+    ts: meta.ts,
+    digest: meta.digest,
+    packages: pkgs.length,
+    notPropagated,
+    // Shown in the gating-criteria panel, so it must be the value the gate really
+    // used rather than a hardcoded one; the bioc->R mapping shifts with the R
+    // release cycle. A config.yaml outage degrades the panel, not the dashboard.
+    rMinor: await gatingRMinor(universe).catch(() => "unresolved"),
+    configs,
+    recentObs: list.objects.slice(-8).reverse().map((o) => ({ key: o.key, size: o.size })),
+    obsCount: list.truncated ? "1000+" : String(list.objects.length),
+    propagated,
+  };
+}
+
+const STATUS_ORDER = ["OK", "NOTE", "WARNING", "ERROR", "FAILURE"];
+// Status palette (validated, mode-invariant): OK→good WARNING→warning ERROR→serious FAIL/FAILURE→critical
+const STATUS_COLOR: Record<string, string> = {
+  OK: "#0ca30c",
+  WARNING: "#fab219",
+  ERROR: "#ec835a",
+  FAIL: "#d03b3b",
+  FAILURE: "#d03b3b",
+};
+
+const THEME = (maxw: number) => `
+  :root { --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781; --line:#e5e4e0;
+    --link:#0a66c2; }
+  @media (prefers-color-scheme: dark) {
+    :root { --surface:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781; --line:#33322f;
+      --link:#79b8ff; }
+  }
+  * { box-sizing:border-box; margin:0 }
+  /* Without this every page falls back to the UA's #0000EE, which is near-black on
+     the light palette and clashes with the warm greys. An author rule on the bare
+     element also beats the UA's a:visited purple, so one line covers both states. */
+  a { color:var(--link) }
+  body { background:var(--page); color:var(--ink); font:15px/1.5 system-ui,sans-serif; max-width:${maxw}px; margin:0 auto; padding:24px 16px }`;
+
+const esc = (s: string) =>
+  s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!));
+
+// github.com/{owner}/{repo}/runs/{id} resolves a CHECK RUN id, not an Actions job
+// id — different id spaces that collide freely, so that form silently lands on
+// some unrelated package. The only URL that takes a job id needs the run id too,
+// which is what _buildurl carries. No run, no link: a missing link beats a
+// confidently wrong one.
+const ghJob = (buildurl: string | undefined, job: number) =>
+  buildurl ? ` · <a href="${esc(buildurl)}/job/${job}">gh</a>` : "";
+
+const age = (ts: string, now: number) => {
+  const m = Math.round((now - Date.parse(ts)) / 60000);
+  return m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
+};
+
+function universeHtml(s: Summary, now: number): string {
+  const statuses = [
+    ...STATUS_ORDER.filter((st) => Object.values(s.configs).some((c) => c[st])),
+    ...[...new Set(Object.values(s.configs).flatMap(Object.keys))]
+      .filter((st) => !STATUS_ORDER.includes(st))
+      .sort(),
+  ];
+  const rows = Object.keys(s.configs)
+    .sort()
+    .map((cfg) => {
+      const cells = statuses
+        .map((st) => {
+          const n = s.configs[cfg][st] ?? 0;
+          const dot = n && STATUS_COLOR[st] ? `<i style="background:${STATUS_COLOR[st]}"></i>` : "";
+          return `<td class="${n ? "" : "zero"}">${dot}${n}</td>`;
+        })
+        .join("");
+      return `<tr><th>${esc(cfg)}</th>${cells}</tr>`;
+    })
+    .join("");
+
+  return `<section>
+  <h2>${esc(s.universe)} <span class="digest">${s.digest.slice(0, 12)}</span></h2>
+  <div class="tiles">
+    <div class="tile"><b>${s.packages}</b><span>packages</span></div>
+    <div class="tile"><b>${s.notPropagated.length}</b><span>not propagated</span></div>
+    <div class="tile"><b>${age(s.ts, now)}</b><span>last change</span></div>
+    <div class="tile"><b>${s.obsCount}</b><span>observations</span></div>
+    <div class="tile"><b>${s.propagated}</b><span>propagated</span></div>
+  </div>
+  <table>
+    <thead><tr><th>config</th>${statuses.map((st) => `<th>${esc(st)}</th>`).join("")}</tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <details><summary>why are packages not propagated? <i class="info">i</i></summary>
+    <p>A package propagates when <b>all</b> of the following hold. R ${esc(s.rMinor)} is the gating R for
+      ${esc(s.universe)}, resolved from <a href="https://bioconductor.org/config.yaml">config.yaml</a> at
+      evaluate time — the bioc&rarr;R mapping shifts with the R release cycle.</p>
+    <ol>
+      <li><code>_status</code> is <code>success</code> and the build reported at least one job.</li>
+      <li>Checks pass on <b>at least one architecture</b>: linux, windows or mac. An architecture passes
+        when its gating jobs are free of <code>ERROR</code>, <code>FAIL</code> and <code>FAILURE</code>
+        (<code>NOTE</code> and <code>WARNING</code> pass). Gating jobs run R ${esc(s.rMinor)}.x on:
+        <code>source</code> + linux x86_64, windows x86_64, macOS arm64 — matching what production BBS
+        tests.</li>
+      <li>The version is a strict bump over the version already propagated.</li>
+    </ol>
+    <p><b>Only the passing architectures propagate.</b> The source tarball always rides with an eligible
+      package; binaries for a failing architecture are simply not available until a later version passes
+      there. The passing set is recorded per entry in the index (<code>archs</code>).</p>
+    <p><b>Advisory, never blocking:</b> BiocCheck (<code>bioc-checks</code>) and <code>wasm</code>, plus other R
+      lines, arm64 linux, macOS x86_64 and windows arm64. These are tracked and the BiocCheck verdict is
+      recorded in the index, but they cannot stop propagation — mirroring BBS, which excludes BiocCheck from
+      the propagation decision. Most <code>ERROR</code>s in the table above are BiocCheck.</p></details>
+  <details><summary>not propagated (${s.notPropagated.length})</summary>
+    <p class="pkgs">${s.notPropagated.map((p) => `<a href="/pkg/${esc(s.universe)}/${encodeURIComponent(p)}">${esc(p)}</a>`).join(", ") || "none"}</p></details>
+  <details><summary>recent observations</summary>
+    <ul>${s.recentObs.map((o) => `<li>${esc(o.key)} <span class="muted">${(o.size / 1e6).toFixed(1)}MB</span></li>`).join("")}</ul></details>
+</section>`;
+}
+
+function dashboardHtml(summaries: (Summary | null)[], now: number): string {
+  const body = summaries
+    .map((s, i) => s ? universeHtml(s, now) : `<section><h2>${UNIVERSES[i]}</h2><p>no observations yet</p></section>`)
+    .join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bioc-registry observer</title>
+<style>${THEME(880)}
+  h1 { font-size:20px; margin-bottom:4px }
+  h2 { font-size:17px; margin:0 0 12px }
+  .sub { color:var(--ink2); margin-bottom:12px }
+  .jump { margin-bottom:24px; display:flex; gap:6px }
+  .jump select, .jump input, .jump button { font:14px system-ui; padding:4px 8px; border:1px solid var(--line);
+    border-radius:6px; background:var(--surface); color:var(--ink) }
+  section { background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:16px 18px; margin-bottom:20px }
+  .digest { font:12px ui-monospace,monospace; color:var(--muted); font-weight:normal }
+  .tiles { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px }
+  .tile { flex:1 1 120px; border:1px solid var(--line); border-radius:6px; padding:10px 12px }
+  .tile b { display:block; font-size:22px } .tile span { color:var(--ink2); font-size:13px }
+  .info { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+    border:1px solid var(--muted); border-radius:50%; font:italic 600 10px/1 serif; color:var(--muted);
+    vertical-align:1px }
+  details p { margin:8px 0; color:var(--ink2) } details ol { margin:8px 0 8px 20px; color:var(--ink2) }
+  details li { margin:3px 0 } code { font:12px ui-monospace,monospace; color:var(--ink) }
+  table { border-collapse:collapse; width:100%; font-size:14px }
+  th, td { text-align:right; padding:5px 10px; border-bottom:1px solid var(--line) }
+  tbody th { text-align:left; font-weight:500; font-family:ui-monospace,monospace; font-size:13px }
+  thead th { color:var(--muted); font-weight:500 }
+  td i { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px }
+  td.zero { color:var(--muted) }
+  details { margin-top:12px; font-size:14px } summary { cursor:pointer; color:var(--ink2) }
+  .pkgs { color:var(--ink2); font-size:13px; margin-top:6px }
+  ul { margin:6px 0 0 18px; font:13px ui-monospace,monospace } .muted { color:var(--muted) }
+  footer { color:var(--muted); font-size:13px }
+</style></head><body>
+<h1>bioc-registry observer</h1>
+<p class="sub">r-universe build tracking — polls every 15 min, archives on change</p>
+<form class="jump" onsubmit="location='/pkg/'+this.u.value+'/'+encodeURIComponent(this.p.value.trim());return false">
+  <select name="u">${UNIVERSES.map((u) => `<option>${u}</option>`).join("")}</select>
+  <input name="p" placeholder="package name" required> <button>view</button>
+</form>
+${body}
+<footer>rendered ${new Date(now).toISOString()} · <a href="/sql">sql</a> ·
+repo: ${UNIVERSES.map((u) => `<a href="/repo/${u}/src/contrib/PACKAGES">${u}</a>`).join(" · ")}</footer>
+</body></html>`;
+}
+
+const SQL_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bioc-registry sql</title>
+<style>${THEME(1100)}
+  h1 { font-size:20px; margin-bottom:12px }
+  textarea { width:100%; height:120px; font:13px ui-monospace,monospace; color:var(--ink);
+    background:var(--surface); border:1px solid var(--line); border-radius:6px; padding:10px }
+  button { font:14px system-ui; padding:6px 16px; margin:8px 0; border:1px solid var(--line);
+    border-radius:6px; background:var(--surface); color:var(--ink); cursor:pointer }
+  #status { color:var(--muted); font-size:13px; margin-left:8px }
+  .wrap { overflow-x:auto }
+  table { border-collapse:collapse; font-size:13px; margin-top:8px }
+  th, td { text-align:left; padding:4px 10px; border-bottom:1px solid var(--line); white-space:nowrap }
+  th { color:var(--ink2); font-weight:500 } td { font-family:ui-monospace,monospace }
+</style></head><body>
+<h1>bioc-registry sql <a href="/" style="font-size:13px">← dashboard</a></h1>
+<textarea id="q">SELECT universe, config, "check", count(*) AS n
+FROM jobs GROUP BY ALL ORDER BY universe, config, "check"</textarea>
+<div><button id="run">Run</button><span id="status">loading DuckDB…</span></div>
+<div class="wrap" id="out"></div>
+<script type="module">
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
+const status = (m) => document.getElementById("status").textContent = m;
+let conn;
+try {
+  const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+  const workerUrl = URL.createObjectURL(new Blob(['importScripts("' + bundle.mainWorker + '");'], { type: "text/javascript" }));
+  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), new Worker(workerUrl));
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  conn = await db.connect();
+  const files = await (await fetch("/manifest.json")).json();
+  if (!files.length) { status("no parquet files yet"); }
+  else {
+    const urls = files.map((k) => "'" + location.origin + "/data/" + k + "'");
+    // union_by_name covers files written before deltas landed, but it only unions
+    // columns that SOME file has — when every file predates the change there is no
+    // \`deleted\` column at all and anything referencing it fails to bind. So
+    // normalise it in, and everything downstream can assume it exists.
+    await conn.query("CREATE VIEW raw AS SELECT * FROM read_parquet([" +
+      urls.join(",") + "], union_by_name=true)");
+    const hasDel = (await conn.query("SELECT 1 FROM (DESCRIBE raw) WHERE column_name = 'deleted'")).numRows > 0;
+    await conn.query("CREATE VIEW jobs_delta AS SELECT *" +
+      (hasDel ? "" : ", NULL::INTEGER AS deleted") + " FROM raw");
+    // Observations that changed nothing store no rows, so they exist only in this
+    // list. Older observations predate the list but were stored whole, so their
+    // timestamps are still recoverable from the rows themselves.
+    const seen = [];
+    for (const u of ${JSON.stringify(UNIVERSES)}) {
+      const r = await fetch("/data/state/" + u + "/observations.json");
+      if (r.ok) for (const ts of await r.json()) seen.push("('" + u + "','" + ts + "')");
+    }
+    await conn.query("CREATE VIEW observations AS SELECT DISTINCT universe, obs_ts FROM jobs_delta" +
+      (seen.length ? " UNION SELECT * FROM (VALUES " + seen.join(",") + ") v(universe, obs_ts)" : ""));
+    // jobs reconstructs the full snapshot at every observation, so queries written
+    // against the old full-snapshot table keep their meaning. jobs_delta is the
+    // rows as actually stored.
+    await conn.query(\`CREATE VIEW jobs AS
+      SELECT d.universe, o.obs_ts, d.package, d.version, d.sha256, d.created, d.expires,
+             d.config, d.r, d."check", d.time, d.job, d.artifact
+      FROM observations o
+      JOIN (SELECT DISTINCT universe, package, config FROM jobs_delta) k USING (universe)
+      ASOF JOIN jobs_delta d ON d.universe = k.universe AND d.package = k.package
+        AND d.config = k.config AND d.obs_ts <= o.obs_ts
+      WHERE d.deleted IS NULL\`);
+    status(files.length + " file(s) → views: jobs (reconstructed), jobs_delta (as stored)");
+  }
+} catch (e) { status("init failed: " + e); }
+async function run() {
+  if (!conn) return;
+  status("running…");
+  const t0 = performance.now();
+  try {
+    const res = await conn.query(document.getElementById("q").value);
+    const rows = res.toArray().slice(0, 500);
+    const cols = res.schema.fields.map((f) => f.name);
+    document.getElementById("out").innerHTML =
+      "<table><thead><tr>" + cols.map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>" +
+      rows.map((r) => "<tr>" + cols.map((c) => "<td>" + String(r[c]) + "</td>").join("") + "</tr>").join("") +
+      "</tbody></table>";
+    status(res.numRows + " rows (" + (res.numRows > 500 ? "showing 500, " : "") + Math.round(performance.now() - t0) + "ms)");
+  } catch (e) { status(String(e)); }
+}
+document.getElementById("run").onclick = run;
+document.getElementById("q").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run();
+});
+</script></body></html>`;
+
+const checkCell = (check?: string | null) => {
+  const c = check ?? "—";
+  const dot = STATUS_COLOR[c] ? `<i style="background:${STATUS_COLOR[c]}"></i>` : "";
+  return dot + esc(c);
+};
+
+async function pkgPage(env: Env, universe: string, name: string, now: number): Promise<Response> {
+  const last = await env.ARCHIVE.get(`state/${universe}/latest`);
+  const meta = last && (await last.json<{ digest: string; key: string; ts: string }>());
+  const obs = meta && (await env.ARCHIVE.get(meta.key));
+  if (!obs) return new Response("no observations yet", { status: 404 });
+  const p = (await obs.json<FullPkg[]>()).find((x) => x.Package === name);
+  if (!p) return new Response(`package ${name} not in latest ${universe} observation`, { status: 404 });
+  const prop = (await readIndex(env, universe))[name];
+
+  const rows = [...(p._jobs ?? [])]
+    .sort((a, b) => a.config.localeCompare(b.config))
+    .map((j) => `<tr><th>${esc(j.config)}</th><td>${esc(j.r ?? "")}</td><td>${checkCell(j.check)}</td>
+      <td>${j.time != null ? j.time + "s" : ""}</td>
+      <td>${j.job ? `<a href="/logs/${universe}/${j.job}">log</a>${ghJob(p._buildurl, j.job)}` : ""}</td></tr>`)
+    .join("");
+
+  const failure = p._failure
+    ? `<p class="warn">newer commit failed to build${p._failure.version ? ` (version ${esc(p._failure.version)})` : ""} —
+       shown results are the last successful build.${p._failure.buildurl ? ` <a href="${esc(p._failure.buildurl)}">build log</a>` : ""}</p>`
+    : "";
+
+  const propHtml = prop
+    ? `<div class="tile"><b>${esc(prop.version)}</b><span>propagated ${age(prop.ts, now)}</span></div>
+       <div class="tile"><b>${prop.artifacts.length}</b><span>artifacts</span></div>
+       <div class="tile"><b>${checkCell(prop.bioccheck ?? "—")}</b><span>bioccheck at prop</span></div>`
+    : `<div class="tile"><b>—</b><span>not propagated</span></div>`;
+
+  const artifacts = prop
+    ? `<details><summary>propagated artifacts</summary>
+       <ul>${prop.artifacts.map((a) => `<li><a href="/data/prop/${universe}/cas/${a.sha256}">${esc(a.os)}${a.r ? " R " + esc(a.r) : ""}</a> <span class="muted">${a.sha256.slice(0, 12)}</span></li>`).join("")}</ul></details>`
+    : "";
+
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(name)} · ${esc(universe)}</title>
+<style>${THEME(880)}
+  h1 { font-size:20px; margin-bottom:4px } h2 { font-size:16px; margin:20px 0 8px }
+  .sub { color:var(--ink2); margin-bottom:16px } .sub a { color:var(--ink2) }
+  .warn { background:color-mix(in srgb, #fab219 12%, var(--surface)); border:1px solid #fab219;
+    border-radius:6px; padding:8px 12px; margin-bottom:16px; font-size:14px }
+  .tiles { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px }
+  .tile { flex:1 1 120px; border:1px solid var(--line); border-radius:6px; padding:10px 12px; background:var(--surface) }
+  .tile b { display:block; font-size:20px } .tile span { color:var(--ink2); font-size:13px }
+  .wrap { overflow-x:auto }
+  table { border-collapse:collapse; width:100%; font-size:14px; background:var(--surface);
+    border:1px solid var(--line); border-radius:8px }
+  th, td { text-align:left; padding:5px 10px; border-bottom:1px solid var(--line); white-space:nowrap }
+  tbody th { font-weight:500; font-family:ui-monospace,monospace; font-size:13px }
+  thead th { color:var(--muted); font-weight:500 }
+  i { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px }
+  details { margin-top:12px; font-size:14px } summary { cursor:pointer; color:var(--ink2) }
+  ul { margin:6px 0 0 18px; font:13px ui-monospace,monospace } .muted { color:var(--muted) }
+  #status { color:var(--muted); font-size:13px }
+</style></head><body>
+<h1>${esc(name)} <span class="muted">${esc(p.Version ?? "")}</span></h1>
+<p class="sub"><a href="/">← dashboard</a> · ${esc(universe)} · status ${esc(p._status ?? "?")} ·
+  built ${p._created ? age(p._created, now) : "?"} · observed ${age(meta.ts, now)} ·
+  <a href="https://${esc(universe)}.r-universe.dev/${encodeURIComponent(name)}">r-universe</a></p>
+${failure}
+<div class="tiles">${propHtml}</div>
+<h2>current build jobs</h2>
+<div class="wrap"><table>
+  <thead><tr><th>config</th><th>R</th><th>check</th><th>time</th><th>links</th></tr></thead>
+  <tbody>${rows || "<tr><td colspan=5>no jobs</td></tr>"}</tbody>
+</table></div>
+${artifacts}
+<h2>history <span id="status">loading DuckDB…</span></h2>
+<div class="wrap" id="hist"></div>
+<script type="module">
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
+const status = (m) => document.getElementById("status").textContent = m;
+const COLOR = ${JSON.stringify(STATUS_COLOR)};
+const PKG = ${JSON.stringify(name)}, UNI = ${JSON.stringify(universe)};
+try {
+  const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+  const workerUrl = URL.createObjectURL(new Blob(['importScripts("' + bundle.mainWorker + '");'], { type: "text/javascript" }));
+  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), new Worker(workerUrl));
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  const conn = await db.connect();
+  const files = (await (await fetch("/manifest.json")).json())
+    .filter((k) => k.includes("universe=" + UNI + "/"));
+  if (!files.length) { status("no parquet files yet"); }
+  else {
+    const urls = files.map((k) => "'" + location.origin + "/data/" + k + "'");
+    await conn.query("CREATE VIEW raw AS SELECT * FROM read_parquet([" +
+      urls.join(",") + "], union_by_name=true)");
+    // Same normalisation as /sql: files older than the delta change have no
+    // \`deleted\` column for union_by_name to find.
+    const hasDel = (await conn.query("SELECT 1 FROM (DESCRIBE raw) WHERE column_name = 'deleted'")).numRows > 0;
+    const res = await conn.query(
+      "SELECT obs_ts, config, \\"check\\", " + (hasDel ? "deleted" : "NULL AS deleted") +
+      " FROM raw WHERE package = '" + PKG.replaceAll("'", "''") + "' ORDER BY obs_ts");
+    const rows = res.toArray();
+    const configs = [...new Set(rows.map((r) => r.config))].sort();
+    // Rows are stored only when they change, so replay them in order and carry the
+    // last value forward; a tombstone drops the config again. Same walk the write
+    // side is tested against.
+    const obsList = await (await fetch("/data/state/" + UNI + "/observations.json"))
+      .json().catch(() => []);
+    const stamps = [...new Set([...rows.map((r) => r.obs_ts), ...obsList])].sort();
+    const delta = {};
+    for (const r of rows) (delta[r.obs_ts] ??= []).push(r);
+    const byTs = {};
+    const live = {};
+    for (const ts of stamps) {
+      for (const r of delta[ts] ?? []) {
+        if (r.deleted) delete live[r.config]; else live[r.config] = r.check;
+      }
+      byTs[ts] = { ...live };
+    }
+    const cell = (c) => c == null ? "<td></td>" :
+      "<td>" + (COLOR[c] ? '<i style="background:' + COLOR[c] + '"></i>' : "") + c + "</td>";
+    document.getElementById("hist").innerHTML =
+      "<table><thead><tr><th>observation</th>" + configs.map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>" +
+      Object.keys(byTs).sort().reverse().map((ts) =>
+        "<tr><th>" + ts.slice(0, 16).replace("T", " ") + "</th>" + configs.map((c) => cell(byTs[ts][c])).join("") + "</tr>").join("") +
+      "</tbody></table>";
+    status(Object.keys(byTs).length + " observations");
+  }
+} catch (e) { status("history failed: " + e); }
+</script></body></html>`;
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+// Everything served here is public and read-only, and the /docs try-it panel is
+// itself a cross-origin caller — so CORS goes on in one place rather than being
+// remembered (or forgotten) at each of the ~20 return points below.
+//
+// Cache-control defaults to no-store for the same reason. Every page here is
+// generated per request, and a cached GET of /poll or /backfill reports a state
+// change that never happened. Routes serving write-once bytes opt out by setting
+// their own cache-control, which this leaves alone.
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+const finish = (res: Response) => {
+  const out = new Response(res.body, res);
+  if (!out.headers.has("access-control-allow-origin")) out.headers.set("access-control-allow-origin", "*");
+  if (!out.headers.has("cache-control")) out.headers.set("cache-control", "no-store");
+  return out;
+};
+
+// Annotated rather than inferred: fetch() refers to handler.route, and TS will not
+// infer the type of a binding referenced inside its own initializer.
+const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<Response> } = {
+  async scheduled(_ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(Promise.all([...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env)]));
+  },
+  async fetch(req: Request, env: Env): Promise<Response> {
+    return finish(await handler.route(req, env));
+  },
+  async route(req: Request, env: Env): Promise<Response> {
+    const { pathname } = new URL(req.url);
+    // The side-effecting maintenance routes are idempotent, but with the code
+    // public "reachable if you read the source" is no protection at all: gate
+    // them on a shared secret. Unset MAINT_KEY (local dev) leaves them open.
+    if (
+      env.MAINT_KEY &&
+      (pathname === "/poll" || pathname === "/reindex" || pathname === "/backfill") &&
+      req.headers.get("x-maint-key") !== env.MAINT_KEY
+    ) {
+      return new Response("forbidden", { status: 403 });
+    }
+    if (pathname === "/poll") {
+      const results = await Promise.all([...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env)]);
+      return new Response(results.join("\n") + "\n");
+    }
+    if (pathname.startsWith("/data/")) {
+      const key = decodeURIComponent(pathname.slice(6));
+      const cors = { "access-control-allow-origin": "*", "access-control-expose-headers": "*" };
+      // obs/, parquet/, prop/ and logs/ objects are write-once; only the state/
+      // pointers are rewritten. Worth distinguishing because /sql issues many range
+      // reads against the same parquet, and no-store would refetch every one.
+      // Applied to hits only — caching a 404 for a year would outlive the gap
+      // between asking for a log and capture writing it.
+      const cc = key.startsWith("state/") ? "no-store" : IMMUTABLE;
+      if (req.method === "HEAD" || req.method === "OPTIONS") {
+        const head = await env.ARCHIVE.head(key);
+        if (!head) return new Response(null, { status: 404, headers: cors });
+        return new Response(null, {
+          headers: { ...cors, "cache-control": cc, "content-length": String(head.size), "accept-ranges": "bytes" },
+        });
+      }
+      const range = req.headers.get("range");
+      const obj = await env.ARCHIVE.get(key, range ? { range: req.headers } : undefined);
+      if (!obj) return new Response("not found", { status: 404, headers: cors });
+      const headers = new Headers(cors);
+      headers.set("accept-ranges", "bytes");
+      headers.set("cache-control", cc);
+      if (range && obj.range && "offset" in obj.range) {
+        const { offset, length } = obj.range as { offset: number; length: number };
+        headers.set("content-range", `bytes ${offset}-${offset + length - 1}/${obj.size}`);
+        headers.set("content-length", String(length));
+        return new Response(obj.body, { status: 206, headers });
+      }
+      headers.set("content-length", String(obj.size));
+      return new Response(obj.body, { headers });
+    }
+    if (pathname === "/manifest.json") {
+      const list = await env.ARCHIVE.list({ prefix: "parquet/", limit: 1000 });
+      return new Response(JSON.stringify(list.objects.map((o) => o.key)), {
+        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+      });
+    }
+    if (pathname === "/backfill") {
+      // ?run=2 salts the instance IDs so a backfill can be relaunched after an
+      // earlier attempt errored (same-ID re-creation throws within retention).
+      const run = new URL(req.url).searchParams.get("run") ?? "";
+      // Idempotent: writes parquet for any archived observation missing it, then
+      // re-runs the workflow for each universe's latest observation (id includes a
+      // bf- prefix so it doesn't collide with the original instance).
+      const list = await env.ARCHIVE.list({ prefix: "obs/", limit: 1000 });
+      const results: string[] = [];
+      for (const o of list.objects) results.push(await writeJobsParquet(env, o.key));
+      for (const u of UNIVERSES) {
+        const last = await env.ARCHIVE.get(`state/${u}/latest`);
+        if (!last) continue;
+        const meta = await last.json<{ digest: string; key: string; ts: string }>();
+        try {
+          await env.OBSERVE.create({
+            id: `bf${run}-${u}-${meta.digest.slice(0, 28)}`,
+            params: { universe: u, key: meta.key, digest: meta.digest, ts: meta.ts },
+          });
+          results.push(`${u}: workflow bf${run}-${u}-${meta.digest.slice(0, 12)} created`);
+        } catch (e) {
+          if (!String(e).includes("already exists")) throw e;
+          results.push(`${u}: backfill workflow already ran`);
+        }
+      }
+      return new Response(results.join("\n") + "\n");
+    }
+    // /repo/<universe>/src/contrib/{PACKAGES,PACKAGES.gz,<pkg>_<ver>.tar.gz}
+    // and the bin/... equivalents. install.packages(repos="…/repo/<universe>")
+    if (pathname.startsWith("/repo/")) {
+      const parts = pathname.slice(6).split("/").map(decodeURIComponent);
+      const universe = parts.shift()!;
+      if (!UNIVERSES.includes(universe)) return new Response("not found", { status: 404 });
+      const tail = parts.pop() ?? "";
+
+      // VIEWS sits at the repo root, exactly where the legacy repos kept it
+      // (packages/<ver>/bioc/VIEWS): PACKAGES fields plus descriptive metadata.
+      if ((tail === "VIEWS" || tail === "VIEWS.gz") && parts.length === 0) {
+        const dcf = viewsDcf(await readIndex(env, universe));
+        const type = { "content-type": "text/plain; charset=utf-8" };
+        if (tail === "VIEWS") return new Response(dcf, { headers: type });
+        return new Response(
+          new Response(dcf).body!.pipeThrough(new CompressionStream("gzip")),
+          { headers: { ...type, "content-encoding": "gzip" } }
+        );
+      }
+
+      const sel = parseRepoDir(parts);
+      if (!sel) return new Response("not found", { status: 404 });
+      const idx = await readIndex(env, universe);
+
+      if (tail === "PACKAGES" || tail === "PACKAGES.gz") {
+        const dcf = packagesDcf(idx, sel);
+        const type = { "content-type": "text/plain; charset=utf-8" };
+        if (tail === "PACKAGES") return new Response(dcf, { headers: type });
+        return new Response(
+          new Response(dcf).body!.pipeThrough(new CompressionStream("gzip")),
+          { headers: { ...type, "content-encoding": "gzip" } }
+        );
+      }
+      // No PACKAGES.rds: available.packages() falls back to PACKAGES.gz, and
+      // writing RDS would drag R into the serving path for one saved parse.
+      if (tail === "PACKAGES.rds") return new Response("not found", { status: 404 });
+
+      const a = findArtifact(idx, tail, sel);
+      if (!a) return new Response("not found", { status: 404 });
+      const obj = await env.ARCHIVE.get(`prop/${universe}/cas/${a.sha256}`);
+      if (!obj) return new Response("artifact not mirrored", { status: 404 });
+      return new Response(obj.body, {
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(obj.size),
+          "cache-control": IMMUTABLE,
+        },
+      });
+    }
+    if (pathname === "/reindex") {
+      const results = await Promise.all(UNIVERSES.map((u) => reindex(u, env)));
+      // Mutating GET: without no-store the edge caches the result and a later
+      // run silently returns the previous run's counts.
+      return new Response(results.join("\n") + "\n", {
+        headers: { "cache-control": "no-store" },
+      });
+    }
+    if (pathname.startsWith("/pkg/")) {
+      const [u, name] = pathname.slice(5).split("/").map(decodeURIComponent);
+      if (!UNIVERSES.includes(u) || !name) return new Response("not found", { status: 404 });
+      return pkgPage(env, u, name, Date.now());
+    }
+    if (pathname.startsWith("/logs/")) {
+      const [u, job] = pathname.slice(6).split("/");
+      if (!UNIVERSES.includes(u) || !/^\d+$/.test(job ?? ""))
+        return new Response("not found", { status: 404 });
+      const text = { "content-type": "text/plain; charset=utf-8" };
+      // Served from our own archive, never proxied: no token on a public route, and
+      // the log stays readable long after GHA has deleted it.
+      const obj = await env.ARCHIVE.get(`logs/${u}/${job}.txt`);
+      // A captured log never changes; the 404 below deliberately stays no-store,
+      // since it turns into a hit as soon as capture reaches that job.
+      if (obj) return new Response(obj.body, { headers: { ...text, "cache-control": IMMUTABLE } });
+      return new Response(
+        `log not captured (capture only walks forward from when it was switched on).\n` +
+          `While GHA still has it: https://github.com/r-universe/${u}/runs/${job}\n`,
+        { status: 404, headers: text }
+      );
+    }
+    if (pathname === "/sql") {
+      return new Response(SQL_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    if (pathname === "/docs") {
+      return new Response(DOCS_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    if (pathname === "/openapi.json") {
+      return new Response(JSON.stringify(OPENAPI), { headers: { "content-type": "application/json" } });
+    }
+    if (pathname !== "/") return new Response("not found", { status: 404 });
+    const now = Date.now();
+    const summaries = await Promise.all(UNIVERSES.map((u) => summarize(u, env)));
+    return new Response(dashboardHtml(summaries, now), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  },
+};
+
+export default handler;
+
+type ObserveParams = { universe: string; key: string; digest: string; ts: string; offset?: number };
+
+// Empirically an instance's engine exhausts its API-request budget around batch
+// 460-480 regardless of sleeps, so an instance handles at most this many packages
+// and then spawns a continuation instance for the rest.
+const MAX_PER_INSTANCE = 200;
+
+export class ObserveWorkflow extends WorkflowEntrypoint<Env, ObserveParams> {
+  async run(event: WorkflowEvent<ObserveParams>, step: WorkflowStep) {
+    const { universe, key, digest } = event.payload;
+    const offset = event.payload.offset ?? 0;
+    if (offset === 0) {
+      await step.do("jobs-parquet", () => writeJobsParquet(this.env, key));
+    }
+    const { pendingKey, count } = await step.do(`evaluate-${offset}`, async () => {
+      if (offset === 0) return evaluate(this.env, universe, key, digest);
+      const pk = `prop/${universe}/pending/${digest.slice(0, 12)}.json`;
+      const o = await this.env.ARCHIVE.get(pk);
+      return { pendingKey: pk, count: o ? (await o.json<Candidate[]>()).length : 0 };
+    });
+    const end = Math.min(count, offset + MAX_PER_INSTANCE);
+    for (let start = offset; start < end; start += BATCH) {
+      await step.do(`propagate-${start}`, () =>
+        propagateBatch(this.env, universe, pendingKey, start)
+      );
+      await step.sleep(`pause-${start}`, "1 second");
+    }
+    if (end < count) {
+      await step.do("continue", async () => {
+        await this.env.OBSERVE.create({
+          id: `${universe}-${digest.slice(0, 24)}-c${end}`,
+          params: { ...event.payload, offset: end },
+        });
+        return `continued at ${end}/${count}`;
+      });
+    }
+  }
+}

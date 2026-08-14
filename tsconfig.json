@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types/experimental"]
+  },
+  "include": ["src"],
+  "//": "tests run under `node --test --experimental-strip-types`, not the Worker types",
+  "exclude": ["src/*.test.ts"]
+}

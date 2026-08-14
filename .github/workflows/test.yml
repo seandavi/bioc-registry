@@ -1,0 +1,20 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      # Worker deploys stay manual (wrangler deploy) until the repo settles
+      # into its public home; type noise from workers-types is pre-existing,
+      # so gate on src/ diagnostics only.
+      - run: npx tsc -p . --noEmit 2>&1 | grep -E '^src/' && exit 1 || exit 0

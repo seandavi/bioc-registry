@@ -1,0 +1,14 @@
+{
+  "name": "bioc-registry",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "triggers": { "crons": ["*/15 * * * *"] },
+  // R2 buckets cannot be renamed; the bucket keeps its original name.
+  "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "bioc-prop" }],
+  "workflows": [
+    { "name": "bioc-registry-observe", "binding": "OBSERVE", "class_name": "ObserveWorkflow" }
+  ],
+  // ponytail: native CF tracing, no otel SDK. Add @microlabs/otel-cf-workers only if
+  // you need manual spans inside a step; auto-spans cover fetch/R2/workflow already.
+  "observability": { "enabled": true, "traces": { "enabled": true } }
+}
