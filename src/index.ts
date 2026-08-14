@@ -5,7 +5,8 @@ import {
   Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
   describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
   parseGitmodules, parseRepoDir, passingFamilies, pendingJobIds, planCompaction,
-  mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, JobRow, RowState,
+  mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf,
+  writeOnce, JobRow, RowState,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -603,8 +604,11 @@ async function reindex(universe: string, env: Env): Promise<string> {
     if (Object.keys(d).length) { e.desc = d; desc++; } else nodesc++;
     // Same rule for the descriptive metadata (VIEWS/landing pages): only set
     // from an observation that actually carried the fields.
+    // Replace, don't merge: a field dropped upstream should disappear here too.
+    // git_url is the exception — it comes from .gitmodules, not the observation,
+    // so a wholesale replace would drop the link that was just made.
     const m = metaOf(current);
-    if (Object.keys(m).length) e.meta = m;
+    if (Object.keys(m).length) e.meta = mergeMeta(m, e.meta);
   }
   await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
   return `${universe}: described ${desc}, renamed ${renamed}, stale ${stale}, ` +
@@ -1143,12 +1147,16 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
     if (pathname.startsWith("/data/")) {
       const key = decodeURIComponent(pathname.slice(6));
       const cors = { "access-control-allow-origin": "*", "access-control-expose-headers": "*" };
-      // obs/, parquet/, prop/ and logs/ objects are write-once; only the state/
-      // pointers are rewritten. Worth distinguishing because /sql issues many range
-      // reads against the same parquet, and no-store would refetch every one.
+      // Only write-once objects may be cached: observations, parquet, captured
+      // logs, CAS artifacts and ledger entries. Worth distinguishing because
+      // /sql issues many range reads against the same parquet, and no-store
+      // would refetch every one. Everything else is rewritten in place —
+      // state/ pointers, prop/*/index.json on every propagation, the seed plan —
+      // and a year-long immutable cache on those served a stale index to anyone
+      // reading it through /data.
       // Applied to hits only — caching a 404 for a year would outlive the gap
       // between asking for a log and capture writing it.
-      const cc = key.startsWith("state/") ? "no-store" : IMMUTABLE;
+      const cc = writeOnce(key) ? IMMUTABLE : "no-store";
       if (req.method === "HEAD" || req.method === "OPTIONS") {
         const head = await env.ARCHIVE.head(key);
         if (!head) return new Response(null, { status: 404, headers: cors });

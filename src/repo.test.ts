@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf } from "./repo.ts";
+import { describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -505,4 +505,38 @@ test("VIEWS mac paths: arm64 tracks the R version, Intel gets its own field", ()
   // Before R 4.6 the arm64 directory was big-sur-arm64.
   const old = viewsDcf(entry([{ ...arm, r: "4.5.1" }]));
   assert.match(old, /^mac\.binary\.ver: bin\/macosx\/big-sur-arm64\/contrib\/4\.5\/X_1\.0\.0\.tgz$/m);
+});
+
+test("mergeMeta keeps git_url, which no observation carries", () => {
+  // /reindex replaces meta wholesale so a field dropped upstream disappears.
+  // git_url comes from .gitmodules instead, so a plain replace silently unlinked
+  // every entry on the next reindex.
+  const fresh = { Title: "T", Description: "D" };
+  const kept = mergeMeta(fresh, { Title: "old", git_url: "https://github.com/bioc/X" });
+  assert.equal(kept.git_url, "https://github.com/bioc/X");
+  assert.equal(kept.Title, "T");
+  assert.equal(mergeMeta(fresh, { Title: "old" }).git_url, undefined);
+  assert.equal(mergeMeta(fresh).Title, "T");
+  // A field the package dropped upstream must not survive.
+  assert.equal(mergeMeta(fresh, { URL: "https://gone.example" }).URL, undefined);
+});
+
+test("writeOnce: only immutable objects may be cached", () => {
+  for (const k of [
+    "obs/bioc/dt=2026-08-14/x.json",
+    "parquet/jobs/universe=bioc/dt=2026-08-14/x.parquet",
+    "logs/bioc/123.txt",
+    "prop/bioc/cas/abc123",
+    "prop/bioc/log/2026-08-14T00:00:00Z-edgeR_4.10.1.json",
+    "prop/bioc/pending/abc123.json",
+  ]) assert.ok(writeOnce(k), k);
+
+  // These are rewritten in place; caching them serves a stale index.
+  for (const k of [
+    "prop/bioc/index.json",
+    "prop/bioc/seed/plan.json",
+    "prop/bioc/seed/official-versions.json",
+    "state/bioc/latest",
+    "state/bioc/logcursor",
+  ]) assert.ok(!writeOnce(k), k);
 });
