@@ -39,9 +39,39 @@ after it was switched on; anything older 404s here with a link to GHA. Capture
 no-ops entirely without the `GITHUB_TOKEN` worker secret — GitHub returns 403
 for unauthenticated log downloads, though job *metadata* is public.
 
+The token lives in Google Secret Manager (project `cdsci-infra`) as
+`cdsci-github-actions-read-token` — a fine-grained PAT with read-only Actions
+access to public repositories. It is not stored in this repo or in
+`wrangler.jsonc`; it is a worker secret, set once per environment:
+
 ```bash
-npx wrangler secret put GITHUB_TOKEN   # fine-grained PAT: public repos, Actions read-only
+gcloud secrets versions access latest \
+  --secret=cdsci-github-actions-read-token --project=cdsci-infra |
+  tr -d '\r\n' | npx wrangler secret put GITHUB_TOKEN   # tr -d: see below
 ```
+
+A token stored **with a trailing newline** (what piping `gcloud` straight into
+`wrangler secret put` gives you) is worse than no token at all: every request
+throws `TypeError: Invalid header value` before it is sent, and capture's
+`.catch` swallows it, so the only visible symptom is a `logcursor` that never
+moves. `captureLogs` trims the secret defensively, but set it clean anyway.
+
+Finding a job id to test with, and reading the log:
+
+```bash
+B=https://bioc-registry.seandavi.workers.dev
+K=$(curl -s $B/data/state/bioc/latest | jq -r .key)
+curl -s "$B/data/$K" | jq -c '.[] | select(.Package=="edgeR")
+  | {Version, jobs: [._jobs[] | {config, check, job}]}'
+curl -s $B/logs/bioc/<job>
+```
+
+**Whether capture is alive is visible in one place:**
+`curl -s .../data/state/bioc/logcursor`. That integer must move within a cron
+tick or two. It stays frozen when the token is missing (capture returns early)
+and also when the cron invocation dies before the cursor is written — capture is
+wrapped in a `.catch` so nothing surfaces either way. A frozen cursor with the
+secret present means the invocation is failing, not the token.
 
 ### `GET /docs` and `GET /openapi.json`
 

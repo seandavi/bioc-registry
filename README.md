@@ -161,7 +161,29 @@ curl -H "x-maint-key: …" https://bioc-registry.seandavi.workers.dev/poll
 ```
 
 Credentials live in Google Secret Manager (project `cdsci-infra`):
-`cdsci-cloudflare-workers-token`, `cdsci-r2-account-id`. `wrangler tail` reports
+
+| GSM secret | used as | what breaks without it |
+|---|---|---|
+| `cdsci-cloudflare-workers-token` | `CLOUDFLARE_API_TOKEN` | `wrangler deploy` |
+| `cdsci-r2-account-id` | `CLOUDFLARE_ACCOUNT_ID` | `wrangler deploy` |
+| `cdsci-github-actions-read-token` | `GITHUB_TOKEN` worker secret | **log capture silently no-ops** — GitHub 403s unauthenticated log downloads |
+| `cdsci-bioc-registry-maint-key` | `MAINT_KEY` worker secret | `/poll`, `/backfill`, `/reindex` become open to the world |
+
+The two worker secrets are set once per environment and are not in this repo:
+
+```bash
+# tr -d is not optional: gcloud emits a trailing newline, wrangler stores it
+# verbatim, and a token with a newline makes every GitHub request throw
+# "Invalid header value" — silently, since capture swallows its own errors.
+gcloud secrets versions access latest \
+  --secret=cdsci-github-actions-read-token --project=cdsci-infra |
+  tr -d '\r\n' | npx wrangler secret put GITHUB_TOKEN
+npx wrangler secret list        # confirm both are present
+```
+
+Log capture is best-effort and swallows its own errors, so the health check is
+the cursor: `curl -s …/data/state/bioc/logcursor` must advance within a cron
+tick or two. `wrangler tail` reports
 spurious "code had hung" errors for workflow runs — check instance status
 instead, they complete fine.
 
