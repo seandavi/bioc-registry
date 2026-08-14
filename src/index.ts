@@ -81,7 +81,13 @@ async function poll(universe: string, env: Env): Promise<string> {
 const LOGS_PER_RUN = 50;
 
 async function captureLogs(universe: string, env: Env): Promise<string> {
-  if (!env.GITHUB_TOKEN) return `${universe}: capture skipped (no GITHUB_TOKEN)`;
+  // Trimmed because the obvious way to set this secret — piping `gcloud secrets
+  // versions access` into `wrangler secret put` — stores the trailing newline,
+  // and a header value containing one throws "Invalid header value" on every
+  // fetch. That failure is invisible: capture is best-effort, so the only
+  // symptom is a logcursor that never moves.
+  const token = env.GITHUB_TOKEN?.trim();
+  if (!token) return `${universe}: capture skipped (no GITHUB_TOKEN)`;
   const last = await env.ARCHIVE.get(`state/${universe}/latest`);
   if (!last) return `${universe}: capture skipped (no observation yet)`;
   const { key } = await last.json<{ key: string }>();
@@ -98,7 +104,7 @@ async function captureLogs(universe: string, env: Env): Promise<string> {
   for (const job of ids) {
     const gh = await fetch(
       `https://api.github.com/repos/r-universe/${universe}/actions/jobs/${job}/logs`,
-      { headers: { "user-agent": "bioc-registry", authorization: `Bearer ${env.GITHUB_TOKEN}` } }
+      { headers: { "user-agent": "bioc-registry", authorization: `Bearer ${token}` } }
     );
     // Out of budget: stop without advancing, so these ids are retried next run.
     if (gh.status === 403 && gh.headers.get("x-ratelimit-remaining") === "0") break;
