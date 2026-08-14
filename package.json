@@ -1,6 +1,7 @@
 {
   "name": "bioc-prop",
   "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev --test-scheduled",
