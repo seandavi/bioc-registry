@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: >-
+  bioc-registry: the Bioconductor package registry
+message: If you use this software or its data, please cite it as below.
+type: software
+authors:
+  - given-names: Sean
+    family-names: Davis
+    email: seandavi@gmail.com
+  - name: The Bioconductor Core Team
+    website: https://bioconductor.org/about/core-team/
+repository-code: https://github.com/seandavi/bioc-registry
+url: https://bioc-registry.seandavi.workers.dev
+abstract: >-
+  An HTTP API and data plane producer for Bioconductor package metadata:
+  build and check state observed from r-universe, gated propagation of
+  packages and binary artifacts, provenance, a queryable Parquet archive,
+  and an installable CRAN-layout repository.
+keywords:
+  - bioconductor
+  - r
+  - bioinformatics
+  - package-repository
+  - metadata
+  - provenance
+license: Apache-2.0

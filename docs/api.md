@@ -2,7 +2,9 @@
 
 Base URL: `https://bioc-registry.seandavi.workers.dev`
 
-Everything is read-only GET except where noted; no authentication. All data
+Everything is read-only GET and unauthenticated, except the maintenance routes
+(`/poll`, `/backfill`, `/reindex`), which require an `x-maint-key` header
+matching the `MAINT_KEY` worker secret when one is set. All data
 endpoints serve straight from the R2 bucket, so responses are exactly the
 stored objects — this API adds Range/CORS plumbing, not transformation.
 
@@ -129,6 +131,7 @@ curl -s https://bioc-registry.seandavi.workers.dev/manifest.json | jq length
 ### `GET /poll`
 
 Manually runs one poll cycle for both universes (same code path as the cron).
+Requires `x-maint-key`; 403 without it.
 Idempotent: unchanged upstream state is a no-op. Returns one line per universe:
 
 ```
