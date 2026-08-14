@@ -2,9 +2,10 @@ import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from "cloudflare:work
 import { parquetWriteBuffer } from "hyparquet-writer";
 import { parquetReadObjects } from "hyparquet";
 import {
-  Artifact, Desc, Family, Meta, PropIndex, PKG_EXT,
-  describe, findArtifact, metaOf, packagesDcf, parseRepoDir, passingFamilies,
-  pendingJobIds, planCompaction, mergeRows, viewsDcf, JobRow, RowState,
+  Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
+  describe, findArtifact, macArmDir, metaOf, packagesDcf, parseDcf, parseRepoDir,
+  passingFamilies, pendingJobIds, planCompaction, mergeRows, seedArtifacts,
+  seedDesc, seedMeta, verGt, viewsDcf, JobRow, RowState,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -290,15 +291,6 @@ async function gatingRMinor(universe: string): Promise<string> {
 const R_VER = /^\d+([.-]\d+)*$/;
 const BATCH = 20;
 
-function verGt(a: string, b: string): boolean {
-  const pa = a.split(/[.-]/).map(Number), pb = b.split(/[.-]/).map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d) return d > 0;
-  }
-  return false;
-}
-
 type Candidate = {
   package: string; version: string; sha256: string;
   bioccheck: string | null; artifacts: Artifact[]; desc: Desc; meta: Meta;
@@ -402,6 +394,143 @@ async function propagateBatch(env: Env, universe: string, pendingKey: string, st
     };
   await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
   return { start, packages: batch.length, copied };
+}
+
+// ---------- one-time seed from the official Bioconductor repos ----------
+// ~300 packages Bioconductor ships that have never passed this gate: they build
+// in BBS and fail in r-universe's environment, mostly on external services their
+// examples reach (measured: 13 of 14 sampled failures were network errors inside
+// examples/tests, one a real compile failure). Seeding is strictly additive —
+// it only ever fills a hole, never displaces or blocks a propagated entry, and
+// the version gate is untouched, so a seeded package is replaced the ordinary
+// way: the maintainer bumps the version and r-universe builds it.
+
+const BIOC_BRANCH: Record<string, string> = { bioc: "devel", "bioc-release": "release" };
+const SEED_BATCH = 10;
+// ponytail: artifacts are buffered whole to hash them, so one oversized tarball
+// would blow the 128MB isolate. Skipped and reported rather than risked; stream
+// through crypto.DigestStream if a real package ever trips this.
+const SEED_MAX_BYTES = 64 * 1024 * 1024;
+
+type SeedPlan = {
+  base: string;
+  rMinor: string;
+  packages: {
+    package: string; version: string; desc: Desc; meta: Meta; artifacts: SeedArtifact[];
+  }[];
+};
+
+async function fetchText(url: string): Promise<string> {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  return r.text();
+}
+
+// The plan is computed once (VIEWS is 5MB, plus three binary PACKAGES) and
+// stored, so the ~30 batch invocations that follow do not re-fetch 8MB apiece.
+// It also makes the run auditable: what we intended to seed, before we did.
+async function seedPlan(env: Env, universe: string): Promise<SeedPlan> {
+  const key = `prop/${universe}/seed/plan.json`;
+  const cached = await env.ARCHIVE.get(key);
+  if (cached) return cached.json<SeedPlan>();
+
+  const base = `https://bioconductor.org/packages/${BIOC_BRANCH[universe]}/bioc`;
+  const rMinor = await gatingRMinor(universe);
+  const [views, win, macArm, macX86] = await Promise.all([
+    fetchText(`${base}/VIEWS`),
+    fetchText(`${base}/bin/windows/contrib/${rMinor}/PACKAGES`),
+    fetchText(`${base}/bin/macosx/${macArmDir(rMinor)}/contrib/${rMinor}/PACKAGES`),
+    fetchText(`${base}/bin/macosx/${MAC_X86_DIR}/contrib/${rMinor}/PACKAGES`),
+  ]);
+  const versions = (dcf: string) =>
+    new Map(parseDcf(dcf).map((r) => [r.Package, r.Version]));
+  const w = versions(win), ma = versions(macArm), mx = versions(macX86);
+
+  const idx = await readIndex(env, universe);
+  const packages = parseDcf(views)
+    .filter((v) => v.Package && v.Version && !idx[v.Package])
+    .map((v) => ({
+      package: v.Package,
+      version: v.Version,
+      desc: seedDesc(v),
+      meta: seedMeta(v),
+      artifacts: seedArtifacts(v.Package, v.Version, rMinor, {
+        win: w.get(v.Package) === v.Version,
+        macArm: ma.get(v.Package) === v.Version,
+        macX86: mx.get(v.Package) === v.Version,
+      }),
+    }));
+  const plan: SeedPlan = { base, rMinor, packages };
+  await env.ARCHIVE.put(key, JSON.stringify(plan));
+  return plan;
+}
+
+async function seedBatch(
+  env: Env, universe: string, start: number, refresh: boolean
+): Promise<string> {
+  if (refresh) await env.ARCHIVE.delete(`prop/${universe}/seed/plan.json`);
+  const plan = await seedPlan(env, universe);
+  const batch = plan.packages.slice(start, start + SEED_BATCH);
+  if (!batch.length)
+    return `${universe}: seed complete (${plan.packages.length} planned)`;
+
+  const before = await readIndex(env, universe);
+  const ts = new Date().toISOString();
+  const seeded: { package: string; entry: PropIndex[string] }[] = [];
+  let copied = 0, already = 0, missing = 0, oversize = 0;
+
+  for (const p of batch) {
+    // A package propagated since the plan was written keeps its gate verdict.
+    if (before[p.package]) { already++; continue; }
+    const artifacts: Artifact[] = [];
+    for (const a of p.artifacts) {
+      const res = await fetch(`${plan.base}/${a.path}`);
+      // A binary can vanish between plan and fetch; the package still seeds
+      // with whatever else it has.
+      if (!res.ok) { missing++; continue; }
+      const len = Number(res.headers.get("content-length"));
+      if (len > SEED_MAX_BYTES) { oversize++; continue; }
+      const body = await res.arrayBuffer();
+      const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const casKey = `prop/${universe}/cas/${sha256}`;
+      if (await env.ARCHIVE.head(casKey)) already++;
+      else { await env.ARCHIVE.put(casKey, body); copied++; }
+      artifacts.push({ os: a.os, r: a.r, arch: a.arch, sha256, file: a.file });
+    }
+    const src = artifacts.find((a) => a.os === "src");
+    // No source tarball is not a repo entry: PACKAGES would advertise a file
+    // that cannot be downloaded.
+    if (!src) continue;
+    seeded.push({
+      package: p.package,
+      entry: {
+        version: p.version, sha256: src.sha256, ts,
+        // Empty archs and null bioccheck are the honest values: this entry
+        // never faced the gate. origin is what says so.
+        bioccheck: null, artifacts, desc: p.desc, meta: p.meta, archs: [],
+        origin: "bioconductor",
+      },
+    });
+  }
+
+  const idx = await readIndex(env, universe);
+  for (const s of seeded) {
+    await env.ARCHIVE.put(
+      `prop/${universe}/log/${ts}-${s.package}_${s.entry.version}.json`,
+      JSON.stringify({ package: s.package, ...s.entry })
+    );
+    idx[s.package] = s.entry;
+  }
+  if (seeded.length) await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
+
+  const next = start + SEED_BATCH;
+  return `${universe}: seeded ${seeded.length}, ${copied} artifacts copied` +
+    `${already ? `, ${already} already present` : ""}` +
+    `${missing ? `, ${missing} artifacts missing upstream` : ""}` +
+    `${oversize ? `, ${oversize} over ${SEED_MAX_BYTES} bytes` : ""}` +
+    ` — next start=${next} of ${plan.packages.length}`;
 }
 
 // ---------- CRAN-layout repo ----------
@@ -926,13 +1055,15 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
     return finish(await handler.route(req, env));
   },
   async route(req: Request, env: Env): Promise<Response> {
-    const { pathname } = new URL(req.url);
+    const url = new URL(req.url);
+    const { pathname } = url;
     // The side-effecting maintenance routes are idempotent, but with the code
     // public "reachable if you read the source" is no protection at all: gate
     // them on a shared secret. Unset MAINT_KEY (local dev) leaves them open.
     if (
       env.MAINT_KEY &&
-      (pathname === "/poll" || pathname === "/reindex" || pathname === "/backfill") &&
+      (pathname === "/poll" || pathname === "/reindex" || pathname === "/backfill" ||
+        pathname === "/seed") &&
       req.headers.get("x-maint-key") !== env.MAINT_KEY
     ) {
       return new Response("forbidden", { status: 403 });
@@ -1053,6 +1184,14 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
           "cache-control": IMMUTABLE,
         },
       });
+    }
+    if (pathname === "/seed") {
+      const u = url.searchParams.get("universe") ?? "";
+      if (!UNIVERSES.includes(u))
+        return new Response("seed: ?universe=bioc|bioc-release required\n", { status: 400 });
+      const start = Math.max(0, Number(url.searchParams.get("start") ?? 0) || 0);
+      const refresh = url.searchParams.get("refresh") === "1";
+      return new Response(await seedBatch(env, u, start, refresh) + "\n");
     }
     if (pathname === "/reindex") {
       const results = await Promise.all(UNIVERSES.map((u) => reindex(u, env)));

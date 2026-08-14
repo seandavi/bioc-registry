@@ -305,6 +305,122 @@ export function findArtifact(idx: PropIndex, file: string, sel: Sel): Artifact |
   return idx[pkg]?.artifacts.find((a) => a.file === file && matchSel(a, sel));
 }
 
+// ---------- seeding from the official Bioconductor repositories ----------
+// One-time backfill of packages Bioconductor ships that never passed this gate:
+// they build in BBS and fail in r-universe's environment. Everything here is
+// parsing and path construction; the fetching, hashing and writing live in
+// index.ts. A seeded entry carries origin "bioconductor" and never claims a
+// gate verdict.
+
+// DCF: stanzas separated by blank lines, "Field: value", continuation lines
+// indented. Only what the official VIEWS and PACKAGES actually use — no
+// comments, no folded quoting.
+export function parseDcf(text: string): Record<string, string>[] {
+  const out: Record<string, string>[] = [];
+  let rec: Record<string, string> = {};
+  let field = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      if (Object.keys(rec).length) out.push(rec);
+      rec = {}; field = "";
+      continue;
+    }
+    if (/^\s/.test(line) && field) {
+      rec[field] += " " + line.trim();
+      continue;
+    }
+    const i = line.indexOf(":");
+    if (i < 0) continue;
+    field = line.slice(0, i);
+    rec[field] = line.slice(i + 1).trim();
+  }
+  if (Object.keys(rec).length) out.push(rec);
+  return out;
+}
+
+// Version comparison shared by the gate and the seeder: dot- or dash-separated
+// numeric parts, missing parts read as 0.
+export function verGt(a: string, b: string): boolean {
+  const pa = a.split(/[.-]/).map(Number), pb = b.split(/[.-]/).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d) return d > 0;
+  }
+  return false;
+}
+
+// CRAN renamed the macOS arm64 directory at R 4.6 (big-sur-arm64 -> sonoma-arm64)
+// and Bioconductor followed; verified 2026-08-14, big-sur-arm64/4.6 is a 404 on
+// both. Intel stayed put. Used to fetch from Bioconductor and to emit our own
+// mac.binary.ver, so the two can never disagree.
+export const macArmDir = (rMinor: string) =>
+  verGt(rMinor, "4.5") ? "sonoma-arm64" : "big-sur-arm64";
+export const MAC_X86_DIR = "big-sur-x86_64";
+
+const SEED_DESC_FIELDS = [
+  "Priority", "Depends", "Imports", "LinkingTo", "Suggests", "Enhances",
+  "License", "OS_type", "NeedsCompilation",
+] as const;
+
+export function seedDesc(v: Record<string, string>): Desc {
+  const d: Desc = {};
+  for (const k of SEED_DESC_FIELDS) if (v[k]) d[k] = dcfValue(v[k]);
+  return d;
+}
+
+const csv = (s?: string) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+
+export function seedMeta(v: Record<string, string>): Meta {
+  const m: Meta = {};
+  for (const k of META_FIELDS) if (v[k]) m[k] = v[k];
+  const files = csv(v.vignettes), titles = csv(v.vignetteTitles);
+  if (files.length) m.vignettes = files.map((f, i) => ({ filename: f, title: titles[i] }));
+  // The official VIEWS dates the commit but does not stamp it; midnight UTC of
+  // that date round-trips back to the same date through viewsDcf.
+  if (v.git_last_commit)
+    m.commit = {
+      id: v.git_last_commit,
+      time: v.git_last_commit_date
+        ? Date.parse(v.git_last_commit_date + "T00:00:00Z") / 1000
+        : undefined,
+    };
+  return m;
+}
+
+export type SeedArtifact = { os: string; r: string; arch?: string; path: string; file: string };
+
+// Which artifacts to pull for one package. Binary availability comes from each
+// binary directory's own PACKAGES, matched on version: the counts differ from
+// the source repo (release 2384 source vs 2305 windows vs 2332 arm64), so a
+// binary is not guaranteed to exist at the version we are seeding.
+export function seedArtifacts(
+  pkg: string, ver: string, rMinor: string,
+  has: { win?: boolean; macArm?: boolean; macX86?: boolean }
+): SeedArtifact[] {
+  const stem = `${pkg}_${ver}`;
+  const out: SeedArtifact[] = [
+    { os: "src", r: "", path: `src/contrib/${stem}.tar.gz`, file: `${stem}.tar.gz` },
+  ];
+  if (has.win)
+    out.push({
+      os: "win", r: rMinor, arch: "x86_64",
+      path: `bin/windows/contrib/${rMinor}/${stem}.zip`, file: `${stem}.zip`,
+    });
+  if (has.macArm)
+    out.push({
+      os: "mac", r: rMinor, arch: "arm64",
+      path: `bin/macosx/${macArmDir(rMinor)}/contrib/${rMinor}/${stem}.tgz`,
+      file: `${stem}.tgz`,
+    });
+  if (has.macX86)
+    out.push({
+      os: "mac", r: rMinor, arch: "x86_64",
+      path: `bin/macosx/${MAC_X86_DIR}/contrib/${rMinor}/${stem}.tgz`,
+      file: `${stem}.tgz`,
+    });
+  return out;
+}
+
 // ---------- observation merge (SCD type 2) ----------
 // Consecutive observations are ~99.9% identical: measured 0-50 differing rows out
 // of ~26,850. Storing each one whole makes the history grow ~26MB/day for a few
