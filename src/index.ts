@@ -5,8 +5,8 @@ import {
   Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
   describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
   parseGitmodules, parseRepoDir, passingFamilies, pendingJobIds, planCompaction,
-  mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf,
-  writeOnce, JobRow, RowState,
+  invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
+  viewsDcf, writeOnce, JobRow, RowState,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -422,10 +422,10 @@ async function propagateBatch(env: Env, universe: string, pendingKey: string, st
 
 const BIOC_BRANCH: Record<string, string> = { bioc: "devel", "bioc-release": "release" };
 const SEED_BATCH = 10;
-// ponytail: artifacts are buffered whole to hash them, so one oversized tarball
-// would blow the 128MB isolate. Skipped and reported rather than risked; stream
-// through crypto.DigestStream if a real package ever trips this.
-const SEED_MAX_BYTES = 64 * 1024 * 1024;
+// Small artifacts are hashed in memory — one fetch, one pass. Anything larger is
+// fetched twice instead (below), so the threshold only trades bandwidth for
+// memory headroom; it is well under the 128MB isolate.
+const SEED_BUFFER_MAX = 32 * 1024 * 1024;
 
 type SeedPlan = {
   base: string;
@@ -434,6 +434,46 @@ type SeedPlan = {
     package: string; version: string; desc: Desc; meta: Meta; artifacts: SeedArtifact[];
   }[];
 };
+
+const hex = (b: ArrayBuffer) =>
+  [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+// The CAS key IS the hash, so an artifact has to be hashed before it can be
+// stored — and Bioconductor publishes no checksum to hash against. Small ones
+// are buffered. Large ones are streamed twice: once through a DigestStream to
+// learn the sha256, once into R2. SwathXtend's source tarball is 346MB, nearly
+// three times the isolate's memory ceiling, so this is a real package and not a
+// hypothetical one.
+async function copySeedArtifact(
+  env: Env, universe: string, url: string
+): Promise<string | null> {
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const len = Number(res.headers.get("content-length"));
+
+  if (!len || len <= SEED_BUFFER_MAX) {
+    const body = await res.arrayBuffer();
+    const sha256 = hex(await crypto.subtle.digest("SHA-256", body));
+    const key = `prop/${universe}/cas/${sha256}`;
+    if (!(await env.ARCHIVE.head(key))) await env.ARCHIVE.put(key, body);
+    return sha256;
+  }
+
+  const digest = new DigestStream("SHA-256");
+  await res.body!.pipeTo(digest);
+  const sha256 = hex(await digest.digest);
+  const key = `prop/${universe}/cas/${sha256}`;
+  if (await env.ARCHIVE.head(key)) return sha256;
+
+  const second = await fetch(url);
+  if (!second.ok || !second.body) return null;
+  const { readable, writable } = new FixedLengthStream(
+    Number(second.headers.get("content-length")) || len
+  );
+  second.body.pipeTo(writable);
+  await env.ARCHIVE.put(key, readable);
+  return sha256;
+}
 
 async function fetchText(url: string): Promise<string> {
   const r = await fetch(url);
@@ -462,8 +502,17 @@ async function seedPlan(env: Env, universe: string): Promise<SeedPlan> {
   const w = versions(win), ma = versions(macArm), mx = versions(macX86);
 
   const idx = await readIndex(env, universe);
+  // Absent from the index, or present but invisible: an entry with no recorded
+  // DESCRIPTION is skipped by PACKAGES and VIEWS, so it cannot be installed by
+  // name and nothing outside can tell it exists (#6). Replacing one with a
+  // described, installable entry takes nothing away — but never with an older
+  // version than the one already recorded.
   const packages = parseDcf(views)
-    .filter((v) => v.Package && v.Version && !idx[v.Package])
+    .filter((v) => v.Package && v.Version)
+    .filter((v) => {
+      const e = idx[v.Package];
+      return !e || (invisible(e) && !verGt(e.version, v.Version));
+    })
     .map((v) => ({
       package: v.Package,
       version: v.Version,
@@ -499,32 +548,27 @@ async function seedBatch(
   const before = await readIndex(env, universe);
   const ts = new Date().toISOString();
   const seeded: { package: string; entry: PropIndex[string] }[] = [];
-  let copied = 0, already = 0, missing = 0, oversize = 0;
+  let copied = 0, already = 0, missing = 0, repaired = 0;
 
   for (const p of batch) {
-    // A package propagated since the plan was written keeps its gate verdict.
-    if (before[p.package]) { already++; continue; }
+    // A package that gained a real gate verdict since the plan was written keeps
+    // it; only an invisible entry may still be replaced.
+    const prev = before[p.package];
+    if (prev && !invisible(prev)) { already++; continue; }
     const artifacts: Artifact[] = [];
     for (const a of p.artifacts) {
-      const res = await fetch(`${plan.base}/${a.path}`);
       // A binary can vanish between plan and fetch; the package still seeds
       // with whatever else it has.
-      if (!res.ok) { missing++; continue; }
-      const len = Number(res.headers.get("content-length"));
-      if (len > SEED_MAX_BYTES) { oversize++; continue; }
-      const body = await res.arrayBuffer();
-      const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))]
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-      const casKey = `prop/${universe}/cas/${sha256}`;
-      if (await env.ARCHIVE.head(casKey)) already++;
-      else { await env.ARCHIVE.put(casKey, body); copied++; }
+      const sha256 = await copySeedArtifact(env, universe, `${plan.base}/${a.path}`);
+      if (!sha256) { missing++; continue; }
+      copied++;
       artifacts.push({ os: a.os, r: a.r, arch: a.arch, sha256, file: a.file });
     }
     const src = artifacts.find((a) => a.os === "src");
     // No source tarball is not a repo entry: PACKAGES would advertise a file
     // that cannot be downloaded.
     if (!src) continue;
+    if (prev) repaired++;
     seeded.push({
       package: p.package,
       entry: {
@@ -549,9 +593,9 @@ async function seedBatch(
 
   const next = start + SEED_BATCH;
   return `${universe}: seeded ${seeded.length}, ${copied} artifacts copied` +
-    `${already ? `, ${already} already present` : ""}` +
+    `${repaired ? `, ${repaired} replaced an invisible entry` : ""}` +
+    `${already ? `, ${already} already propagated` : ""}` +
     `${missing ? `, ${missing} artifacts missing upstream` : ""}` +
-    `${oversize ? `, ${oversize} over ${SEED_MAX_BYTES} bytes` : ""}` +
     ` — next start=${next} of ${plan.packages.length}`;
 }
 
