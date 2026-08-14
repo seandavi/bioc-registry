@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
+import { described, describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -539,4 +539,10 @@ test("writeOnce: only immutable objects may be cached", () => {
     "state/bioc/latest",
     "state/bioc/logcursor",
   ]) assert.ok(!writeOnce(k), k);
+});
+
+test("described: the one rule that decides whether R can see an entry", () => {
+  assert.ok(described({ desc: { License: "MIT" } }));
+  assert.ok(!described({}), "no desc at all");
+  assert.ok(!described({ desc: {} }), "empty desc means the data was never captured");
 });

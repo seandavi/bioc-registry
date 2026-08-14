@@ -79,6 +79,14 @@ export const originOf = (e: { origin?: Origin }): Origin => e.origin ?? "r-unive
 
 export type Sel = { os: string; r?: string; arch?: string; distro?: string };
 
+// An entry with no recorded DESCRIPTION is skipped by PACKAGES and VIEWS alike —
+// emitting a stanza with no dependency fields would read as "this package has
+// none". The entry is therefore in the index but invisible to R: it cannot be
+// installed by name, and nothing on the outside can tell it exists.
+export const described = <T extends { desc?: Desc }>(e: T): e is T & { desc: Desc } =>
+  !!e.desc && Object.keys(e.desc).length > 0;
+export const invisible = (e: { desc?: Desc }) => !described(e);
+
 // r-universe binary filenames are not in the API, so we name them ourselves; the
 // name only has to agree with the File field we emit in the matching PACKAGES.
 // _binaries[].os is "win"/"mac"/"linux"/"wasm" — not the longer spellings used in
@@ -208,7 +216,7 @@ export function packagesDcf(idx: PropIndex, sel: Sel): string {
     // EMPTY desc means the same thing: every real package has at least a License,
     // so {} is "we never had the data", not "this package declares nothing".
     // /reindex backfills them from an observation that carries the DESCRIPTION.
-    if (!e.desc || !Object.keys(e.desc).length) continue;
+    if (!described(e)) continue;
     const a = e.artifacts.find((x) => matchSel(x, sel));
     if (!a) continue;
     const rec: Record<string, string | undefined> = {
@@ -263,7 +271,7 @@ export function viewsDcf(idx: PropIndex): string {
     // Same rule as PACKAGES: an entry with no recorded desc predates the
     // DESCRIPTION fields and would emit a stanza that silently claims no
     // dependencies. /reindex backfills it after a fresh observation.
-    if (!e.desc || !Object.keys(e.desc).length) continue;
+    if (!described(e)) continue;
     const m = e.meta ?? {};
     const src = e.artifacts.find((a) => a.os === "src");
     const win = e.artifacts.find((a) => a.os === "win");

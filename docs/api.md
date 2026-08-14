@@ -201,9 +201,12 @@ ship that have never passed this gate — they build in BBS and fail in
 r-universe's environment, usually because an example reaches an external service
 the runner cannot get to. Requires `x-maint-key`.
 
-Strictly additive: it only fills holes. A package already in the index keeps its
-entry, whatever its origin, so a `/seed` run can never displace or block a
-propagated package. The version gate is untouched — a seeded package is replaced
+Additive: it fills holes, and repairs entries that are in the index but invisible
+— one with no recorded DESCRIPTION is skipped by `PACKAGES` and `VIEWS` alike, so
+it cannot be installed by name and nothing outside can tell it exists. Such an
+entry is replaced by a described, installable one, never by an older version. A
+package with a real gate verdict keeps it, so `/seed` can never displace or block
+a propagated package. The version gate is untouched — a seeded package is replaced
 the ordinary way, when its maintainer bumps the version and r-universe builds it.
 
 Seeded entries carry `"origin": "bioconductor"`, an empty `archs`, and a null
@@ -225,6 +228,12 @@ Ten packages per call, walking with `start=N`, same as `/backfill`:
 bioc-release: seeded 10, 34 artifacts copied, 6 artifacts missing upstream — next start=10 of 163
 bioc-release: seed complete (163 planned)
 ```
+
+Artifacts too large to hold in memory are fetched twice — once through a
+`DigestStream` to learn the sha256 the CAS key needs, once to stream into R2.
+Bioconductor publishes no checksum to hash against, and `SwathXtend`'s source
+tarball is 346MB against a 128MB isolate, so this path is load-bearing rather
+than defensive.
 
 Binaries come only from the binary directory's own `PACKAGES` at a matching
 version — the counts differ from source (release: 2384 source, 2305 Windows,
