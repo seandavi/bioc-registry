@@ -476,6 +476,13 @@ async function seedPlan(env: Env, universe: string): Promise<SeedPlan> {
     }));
   const plan: SeedPlan = { base, rMinor, packages };
   await env.ARCHIVE.put(key, JSON.stringify(plan));
+  // Every official version, not just the seedable ones (~60KB against the plan's
+  // several MB), so the dashboard can show how far seeded entries have drifted
+  // without re-fetching a 5MB VIEWS on every page load.
+  await env.ARCHIVE.put(
+    `prop/${universe}/seed/official-versions.json`,
+    JSON.stringify(Object.fromEntries(parseDcf(views).map((v) => [v.Package, v.Version])))
+  );
   return plan;
 }
 
@@ -641,6 +648,10 @@ type Summary = {
   obsCount: string;
   propagated: number;
   seeded: number;
+  // Seeded entries the official repo has since moved past. A seed is frozen
+  // until r-universe propagates the package, so this only grows; visible beats
+  // silent drift, and beats re-seeding on a timer.
+  seedBehind: number;
   rMinor: string;
 };
 
@@ -671,9 +682,14 @@ async function summarize(universe: string, env: Env): Promise<Summary | null> {
   // Seeded entries never passed the gate, so folding them into one number would
   // make the propagation rate improve by ~300 without a single package earning
   // it. Counted apart, and labelled apart on the dashboard.
-  const entries = Object.values(idx);
-  const seeded = entries.filter((e) => originOf(e) === "bioconductor").length;
+  const entries = Object.entries(idx);
+  const seededEntries = entries.filter(([, e]) => originOf(e) === "bioconductor");
+  const seeded = seededEntries.length;
   const propagated = entries.length - seeded;
+  const official = await env.ARCHIVE.get(`prop/${universe}/seed/official-versions.json`);
+  const officialVer = official ? await official.json<Record<string, string>>() : {};
+  const seedBehind = seededEntries
+    .filter(([n, e]) => officialVer[n] && verGt(officialVer[n], e.version)).length;
   return {
     universe,
     ts: meta.ts,
@@ -689,6 +705,7 @@ async function summarize(universe: string, env: Env): Promise<Summary | null> {
     obsCount: list.truncated ? "1000+" : String(list.objects.length),
     propagated,
     seeded,
+    seedBehind,
   };
 }
 
@@ -762,6 +779,7 @@ function universeHtml(s: Summary, now: number): string {
     <div class="tile"><b>${s.obsCount}</b><span>observations</span></div>
     <div class="tile"><b>${s.propagated}</b><span>propagated</span></div>
     ${s.seeded ? `<div class="tile"><b>${s.seeded}</b><span>seeded from Bioconductor</span></div>` : ""}
+    ${s.seedBehind ? `<div class="tile"><b>${s.seedBehind}</b><span>seeded, now behind official</span></div>` : ""}
   </div>
   <table>
     <thead><tr><th>config</th>${statuses.map((st) => `<th>${esc(st)}</th>`).join("")}</tr></thead>

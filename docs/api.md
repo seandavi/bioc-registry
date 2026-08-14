@@ -14,7 +14,7 @@ stored objects — this API adds Range/CORS plumbing, not transformation.
 
 Human dashboard (server-rendered HTML). Per universe: stat tiles (packages, not
 propagated, last change, observations, propagated, and — when any exist — seeded
-from Bioconductor) and a config × check-status table from the latest observation.
+from Bioconductor and how many of those the official repo has moved past) and a config × check-status table from the latest observation.
 Propagated and seeded are counted separately: a seeded package never passed the
 gate, so folding the two together would improve the propagation rate by ~300
 without a single package earning it.
@@ -153,7 +153,11 @@ which; both are installable the same way.
   SystemRequirements/VignetteBuilder/Date, `git_last_commit{,_date}`,
   `source.ver`/`win.binary.ver`/`mac.binary.ver`, `vignettes`/`vignetteTitles`,
   `git_url`, and reverse deps within the propagated set (`dependsOnMe`,
-  `importsMe`, `suggestsMe`). Omitted as unknowable here: MD5sum, Rank, dependencyCount,
+  `importsMe`, `suggestsMe`). The macOS arm64 directory in `mac.binary.ver`
+  follows the R version — CRAN renamed it `big-sur-arm64` → `sonoma-arm64` at
+  R 4.6 — and a second mac build, when we hold one, is advertised as
+  `mac.binary.big-sur-x86_64.ver`, the `mac.binary.<platform>.ver` form the
+  legacy Bioconductor VIEWS used for secondary mac builds. Omitted as unknowable here: MD5sum, Rank, dependencyCount,
   hasREADME/hasNEWS/hasINSTALL/hasLICENSE, Rfiles, htmlDocs, htmlTitles.
 - `src/contrib/{pkg}_{ver}.tar.gz`, `bin/windows/contrib/{r}/{file}`,
   `bin/macosx/{arch}/contrib/{r}/{file}` — artifact bytes from the CAS.
@@ -206,6 +210,11 @@ Windows and both macOS `PACKAGES` files, and stores it at
 `prop/{universe}/seed/plan.json`; later calls read the plan instead of re-fetching
 ~8MB. `refresh=1` discards it, which is what a new Bioconductor release needs.
 
+A seeded entry is frozen: nothing re-reads Bioconductor for it, so it drifts as
+the official release gets patch bumps. The dashboard counts how many have fallen
+behind rather than re-seeding on a timer — the fix for a drifted entry is the
+package propagating normally.
+
 Ten packages per call, walking with `start=N`, same as `/backfill`:
 
 ```
@@ -235,6 +244,7 @@ All addressable through `/data/<key>`.
 | `prop/{universe}/cas/{sha256}` | artifact bytes (source tarball or platform binary), keyed by content hash |
 | `prop/{universe}/pending/{digest12}.json` | gate output for one observation: array of candidates |
 | `prop/{universe}/seed/plan.json` | what a `/seed` run intends to seed: package, version, desc, meta, artifact paths |
+| `prop/{universe}/seed/official-versions.json` | every package version the official Bioconductor repo ships, for the seeded-drift count |
 | `prop/{universe}/log/{ts}-{pkg}_{ver}.json` | propagation ledger entry |
 
 `{universe}` is `bioc` (devel) or `bioc-release`. `{digest12}` is the first 12

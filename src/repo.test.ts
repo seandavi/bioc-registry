@@ -316,7 +316,9 @@ test("VIEWS: metadata, provenance, platform paths, reverse deps", () => {
   assert.match(s4, /git_last_commit_date: 2026-08-10/);
   assert.match(s4, /source\.ver: src\/contrib\/S4Vectors_0\.50\.1\.tar\.gz/);
   assert.match(s4, /win\.binary\.ver: bin\/windows\/contrib\/4\.7\/S4Vectors_0\.50\.1\.zip/);
-  assert.match(s4, /mac\.binary\.ver: bin\/macosx\/big-sur-arm64\/contrib\/4\.7\/S4Vectors_0\.50\.1\.tgz/);
+  // R 4.7 is past CRAN's rename, so arm64 lives in sonoma-arm64 — the path R
+  // actually asks for. big-sur-arm64 here would advertise a 404.
+  assert.match(s4, /mac\.binary\.ver: bin\/macosx\/sonoma-arm64\/contrib\/4\.7\/S4Vectors_0\.50\.1\.tgz/);
   assert.match(s4, /vignettes: S4Vectors\.html/);
   assert.match(s4, /vignetteTitles: An Overview/);
   assert.match(s4, /dependsOnMe: leaf/);
@@ -478,4 +480,29 @@ test("git_url reaches VIEWS, from either origin", () => {
   // and the seeder picks it up from the official VIEWS stanza
   assert.equal(seedMeta({ git_url: "https://git.bioconductor.org/packages/h5vc" }).git_url,
     "https://git.bioconductor.org/packages/h5vc");
+});
+
+test("VIEWS mac paths: arm64 tracks the R version, Intel gets its own field", () => {
+  const entry = (arts) => ({
+    X: {
+      version: "1.0.0", sha256: "s0", ts: "2026-08-14T00:00:00Z",
+      desc: { License: "MIT" },
+      artifacts: [{ os: "src", r: "", sha256: "s0", file: "X_1.0.0.tar.gz" }, ...arts],
+    },
+  });
+  const arm = { os: "mac", r: "4.6.1", arch: "arm64", sha256: "s1", file: "X_1.0.0.tgz" };
+  const x86 = { os: "mac", r: "4.6.1", arch: "x86_64", sha256: "s2", file: "X_1.0.0.tgz" };
+
+  const both = viewsDcf(entry([arm, x86]));
+  assert.match(both, /^mac\.binary\.ver: bin\/macosx\/sonoma-arm64\/contrib\/4\.6\/X_1\.0\.0\.tgz$/m);
+  assert.match(both, /^mac\.binary\.big-sur-x86_64\.ver: bin\/macosx\/big-sur-x86_64\/contrib\/4\.6\/X_1\.0\.0\.tgz$/m);
+
+  // Intel-only must not be advertised as the arm64 build.
+  const intelOnly = viewsDcf(entry([x86]));
+  assert.doesNotMatch(intelOnly, /^mac\.binary\.ver:/m);
+  assert.match(intelOnly, /^mac\.binary\.big-sur-x86_64\.ver:/m);
+
+  // Before R 4.6 the arm64 directory was big-sur-arm64.
+  const old = viewsDcf(entry([{ ...arm, r: "4.5.1" }]));
+  assert.match(old, /^mac\.binary\.ver: bin\/macosx\/big-sur-arm64\/contrib\/4\.5\/X_1\.0\.0\.tgz$/m);
 });
