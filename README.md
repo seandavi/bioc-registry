@@ -19,7 +19,7 @@ can query directly from DuckDB.
 ## Try it in 30 seconds
 
 ```r
-# install from the propagated set (devel; use /repo/bioc-release for release)
+# install from the repo (devel; use /repo/bioc-release for release)
 install.packages("edgeR", repos = "https://bioc-registry.seandavi.workers.dev/repo/bioc")
 ```
 
@@ -97,6 +97,26 @@ BiocCheck and wasm are **advisory**: recorded on the index entry, never
 blocking. The passing set is kept as `archs`, so a consumer can see exactly
 which platforms a package earned.
 
+### Two ways in
+
+Not everything Bioconductor ships passes that gate. About 300 packages build in
+Bioconductor's own build system and fail in r-universe's environment — usually
+because an example reaches an external service the runner cannot get to. Those
+are **seeded** from the official repositories so this registry matches what
+Bioconductor actually publishes.
+
+Every index entry therefore records an `origin`:
+
+| origin | means |
+|---|---|
+| `r-universe` | passed the gate above; `archs` says which platforms |
+| `bioconductor` | seeded from Bioconductor's own release build; never faced this gate, so `archs` is empty and `bioccheck` is null |
+
+Seeding is strictly additive — it only fills holes, and the version gate is
+untouched, so a seeded package is replaced the ordinary way: the maintainer bumps
+the version and r-universe builds it. The dashboard counts the two apart, and
+shows how many seeded entries the official repo has since moved past.
+
 ### What's stored
 
 Everything is write-once except the `state/` pointers, and everything is
@@ -106,7 +126,7 @@ readable through `/data/<key>`:
 |---|---|
 | `obs/{universe}/dt=…` | full observations, forever — the raw record |
 | `parquet/jobs/…` | jobs table, stored as **changes not snapshots** (~99.9% of consecutive rows are identical) |
-| `prop/{universe}/index.json` | the propagated set: version, sha256, artifacts, DESCRIPTION, metadata |
+| `prop/{universe}/index.json` | what the repo serves: version, sha256, artifacts, DESCRIPTION, metadata, source repo, and `origin` |
 | `prop/{universe}/cas/{sha256}` | artifact bytes, content-addressed |
 | `logs/{universe}/{job}.txt` | captured GHA logs, readable after GitHub expires them at ~90 days |
 

@@ -254,7 +254,12 @@ export function viewsDcf(idx: PropIndex): string {
     const m = e.meta ?? {};
     const src = e.artifacts.find((a) => a.os === "src");
     const win = e.artifacts.find((a) => a.os === "win");
-    const mac = e.artifacts.find((a) => a.os === "mac");
+    // Two mac builds share a filename and differ only by arch, so they are
+    // picked apart here rather than by find-first. An arch-less binary is
+    // arch-independent, so it stands in for arm64.
+    const macs = e.artifacts.filter((a) => a.os === "mac");
+    const macArm = macs.find((a) => !a.arch || normArch(a.arch) === "arm64");
+    const macX86 = macs.find((a) => a.arch && normArch(a.arch) === "x86_64");
     const vigTitles = (m.vignettes ?? []).map((v) => v.title).filter(Boolean);
     const vigFiles = (m.vignettes ?? []).map((v) => v.filename).filter(Boolean);
     const rec: Record<string, string | undefined> = {
@@ -287,8 +292,16 @@ export function viewsDcf(idx: PropIndex): string {
       "source.ver": src?.file ? `src/contrib/${src.file}` : undefined,
       "win.binary.ver": win?.file && win.r
         ? `bin/windows/contrib/${rMinor(win.r)}/${win.file}` : undefined,
-      "mac.binary.ver": mac?.file && mac.r
-        ? `bin/macosx/big-sur-arm64/contrib/${rMinor(mac.r)}/${mac.file}` : undefined,
+      // The arm64 directory name follows the R version — CRAN renamed it at
+      // R 4.6 — so it comes from macArmDir rather than a constant, which is
+      // also what the seeder fetches from. The x86_64 line uses the
+      // mac.binary.<platform>.ver form the legacy Bioconductor VIEWS used for
+      // secondary mac builds.
+      "mac.binary.ver": macArm?.file && macArm.r
+        ? `bin/macosx/${macArmDir(rMinor(macArm.r))}/contrib/${rMinor(macArm.r)}/${macArm.file}`
+        : undefined,
+      [`mac.binary.${MAC_X86_DIR}.ver`]: macX86?.file && macX86.r
+        ? `bin/macosx/${MAC_X86_DIR}/contrib/${rMinor(macX86.r)}/${macX86.file}` : undefined,
       vignettes: vigFiles.length ? vigFiles.join(", ") : undefined,
       vignetteTitles: vigTitles.length ? vigTitles.join(", ") : undefined,
       dependsOnMe: rev[pkg].dependsOnMe.join(", ") || undefined,
