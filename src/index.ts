@@ -398,7 +398,7 @@ async function propagateBatch(env: Env, universe: string, pendingKey: string, st
     idx[c.package] = {
       version: c.version, sha256: c.sha256, ts,
       bioccheck: c.bioccheck, artifacts: c.artifacts, desc: c.desc, meta: c.meta,
-      archs: c.archs,
+      archs: c.archs, origin: "r-universe",
     };
   await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
   return { start, packages: batch.length, copied };

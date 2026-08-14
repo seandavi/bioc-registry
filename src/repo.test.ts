@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describe, findArtifact, gateFamily, metaOf, packagesDcf, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, viewsDcf } from "./repo.ts";
+import { describe, findArtifact, gateFamily, metaOf, originOf, packagesDcf, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, viewsDcf } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -324,4 +324,10 @@ test("VIEWS: metadata, provenance, platform paths, reverse deps", () => {
   const leaf = stanzas.find((x) => x.startsWith("Package: leaf"))!;
   assert.doesNotMatch(leaf, /Title:/);
   assert.match(leaf, /Depends: R \(>= 4\.4\), S4Vectors/);
+});
+
+test("originOf: entries predating the field read as propagations", () => {
+  assert.equal(originOf({}), "r-universe");
+  assert.equal(originOf({ origin: "r-universe" }), "r-universe");
+  assert.equal(originOf({ origin: "bioconductor" }), "bioconductor");
 });
