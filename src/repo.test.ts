@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf } from "./repo.ts";
+import { describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -442,4 +442,40 @@ test("a seeded commit date round-trips back through VIEWS unchanged", () => {
     },
   });
   assert.match(dcf, /^git_last_commit_date: 2026-05-01$/m);
+});
+
+test("parseGitmodules maps package name to source repo", () => {
+  // Verbatim shape of r-universe/bioc/.gitmodules, including the .registry
+  // submodule and the handful of packages served straight off Bioconductor git.
+  const map = parseGitmodules([
+    '[submodule ".registry"]',
+    "\tpath = .registry",
+    "\turl = https://github.com/r-universe-org/cran-to-git",
+    "\tbranch = HEAD",
+    '[submodule "edgeR"]',
+    "\tpath = edgeR",
+    "\turl = https://github.com/bioc/edgeR",
+    '[submodule "h5vc"]',
+    "\tpath = h5vc",
+    "\turl = https://git.bioconductor.org/packages/h5vc",
+  ].join("\n"));
+  assert.equal(map.edgeR, "https://github.com/bioc/edgeR");
+  assert.equal(map.h5vc, "https://git.bioconductor.org/packages/h5vc");
+  assert.equal(map[".registry"], "https://github.com/r-universe-org/cran-to-git");
+  // branch = HEAD must not be mistaken for a url
+  assert.equal(Object.keys(map).length, 3);
+});
+
+test("git_url reaches VIEWS, from either origin", () => {
+  const idx = {
+    edgeR: {
+      version: "4.10.1", sha256: "s0", ts: "2026-08-14T00:00:00Z",
+      desc: { License: "GPL" }, meta: { git_url: "https://github.com/bioc/edgeR" },
+      artifacts: [{ os: "src", r: "", sha256: "s0", file: "edgeR_4.10.1.tar.gz" }],
+    },
+  };
+  assert.match(viewsDcf(idx), /^git_url: https:\/\/github\.com\/bioc\/edgeR$/m);
+  // and the seeder picks it up from the official VIEWS stanza
+  assert.equal(seedMeta({ git_url: "https://git.bioconductor.org/packages/h5vc" }).git_url,
+    "https://git.bioconductor.org/packages/h5vc");
 });

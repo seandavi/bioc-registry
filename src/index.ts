@@ -3,9 +3,9 @@ import { parquetWriteBuffer } from "hyparquet-writer";
 import { parquetReadObjects } from "hyparquet";
 import {
   Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
-  describe, findArtifact, macArmDir, metaOf, packagesDcf, parseDcf, parseRepoDir,
-  passingFamilies, pendingJobIds, planCompaction, mergeRows, seedArtifacts,
-  seedDesc, seedMeta, verGt, viewsDcf, JobRow, RowState,
+  describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
+  parseGitmodules, parseRepoDir, passingFamilies, pendingJobIds, planCompaction,
+  mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, JobRow, RowState,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -276,6 +276,18 @@ const compact = (env: Env) =>
 // config-name labels. bioc-checks (BiocCheck), wasm, other R lines and
 // off-gate chips are advisory: tracked, never blocking; the BiocCheck verdict
 // is recorded in the index.
+// Package -> source repo, from the universe's own .gitmodules (see #8): one
+// ~200KB fetch covers every package, so there is no per-package lookup. Best
+// effort — a GitHub blip must not fail a propagation, it just leaves git_url
+// unset until the next pass.
+async function gitUrls(universe: string): Promise<Record<string, string>> {
+  const res = await fetch(
+    `https://raw.githubusercontent.com/r-universe/${universe}/HEAD/.gitmodules`
+  );
+  if (!res.ok) throw new Error(`.gitmodules: HTTP ${res.status}`);
+  return parseGitmodules(await res.text());
+}
+
 async function gatingRMinor(universe: string): Promise<string> {
   const res = await fetch("https://bioconductor.org/config.yaml");
   if (!res.ok) throw new Error(`config.yaml: HTTP ${res.status}`);
@@ -386,10 +398,12 @@ async function propagateBatch(env: Env, universe: string, pendingKey: string, st
   // ponytail: read-modify-write; concurrent same-universe instances could clobber an
   // entry, but copies are idempotent and the next wave re-converges the index.
   const idx = await readIndex(env, universe);
+  const urls = await gitUrls(universe).catch(() => ({} as Record<string, string>));
   for (const c of batch)
     idx[c.package] = {
       version: c.version, sha256: c.sha256, ts,
-      bioccheck: c.bioccheck, artifacts: c.artifacts, desc: c.desc, meta: c.meta,
+      bioccheck: c.bioccheck, artifacts: c.artifacts,
+      desc: c.desc, meta: { ...c.meta, ...(urls[c.package] ? { git_url: urls[c.package] } : {}) },
       archs: c.archs, origin: "r-universe",
     };
   await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
@@ -547,7 +561,8 @@ async function reindex(universe: string, env: Env): Promise<string> {
   if (!obs) return `${universe}: missing ${meta.key}`;
   const byName = new Map((await obs.json<FullPkg[]>()).map((p) => [p.Package, p]));
   const idx = await readIndex(env, universe);
-  let renamed = 0, desc = 0, stale = 0, nodesc = 0;
+  const urls = await gitUrls(universe).catch(() => ({} as Record<string, string>));
+  let renamed = 0, desc = 0, stale = 0, nodesc = 0, linked = 0;
   for (const [name, e] of Object.entries(idx)) {
     const p = byName.get(name);
     // Binaries are only described by the observation while it still reports the
@@ -566,6 +581,13 @@ async function reindex(universe: string, env: Env): Promise<string> {
       if (a.file !== want) { a.file = want; renamed++; }
       a.arch ??= bins.get(a.sha256)?.arch;
     }
+    // git_url comes from the universe's .gitmodules, not the observation, so it
+    // is filled for stale entries too — knowing where a package's source lives
+    // is exactly what you want for one that stopped propagating.
+    if (urls[name] && e.meta?.git_url !== urls[name]) {
+      e.meta = { ...(e.meta ?? {}), git_url: urls[name] };
+      linked++;
+    }
     if (!current) { stale++; continue; }
     const d = describe(current);
     // An observation archived before FIELDS carried the DESCRIPTION yields {}.
@@ -579,7 +601,8 @@ async function reindex(universe: string, env: Env): Promise<string> {
   }
   await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
   return `${universe}: described ${desc}, renamed ${renamed}, stale ${stale}, ` +
-    `no-description-in-observation ${nodesc}, total ${Object.keys(idx).length}`;
+    `linked ${linked}, no-description-in-observation ${nodesc}, ` +
+    `total ${Object.keys(idx).length}`;
 }
 
 // ---------- dashboard ----------
@@ -617,6 +640,7 @@ type Summary = {
   recentObs: { key: string; size: number }[];
   obsCount: string;
   propagated: number;
+  seeded: number;
   rMinor: string;
 };
 
@@ -644,7 +668,12 @@ async function summarize(universe: string, env: Env): Promise<Summary | null> {
   // the universe cannot make the count go negative.
   const idx = await readIndex(env, universe);
   const notPropagated = pkgs.map((p) => p.Package).filter((n) => !idx[n]).sort();
-  const propagated = Object.keys(idx).length;
+  // Seeded entries never passed the gate, so folding them into one number would
+  // make the propagation rate improve by ~300 without a single package earning
+  // it. Counted apart, and labelled apart on the dashboard.
+  const entries = Object.values(idx);
+  const seeded = entries.filter((e) => originOf(e) === "bioconductor").length;
+  const propagated = entries.length - seeded;
   return {
     universe,
     ts: meta.ts,
@@ -659,6 +688,7 @@ async function summarize(universe: string, env: Env): Promise<Summary | null> {
     recentObs: list.objects.slice(-8).reverse().map((o) => ({ key: o.key, size: o.size })),
     obsCount: list.truncated ? "1000+" : String(list.objects.length),
     propagated,
+    seeded,
   };
 }
 
@@ -731,6 +761,7 @@ function universeHtml(s: Summary, now: number): string {
     <div class="tile"><b>${age(s.ts, now)}</b><span>last change</span></div>
     <div class="tile"><b>${s.obsCount}</b><span>observations</span></div>
     <div class="tile"><b>${s.propagated}</b><span>propagated</span></div>
+    ${s.seeded ? `<div class="tile"><b>${s.seeded}</b><span>seeded from Bioconductor</span></div>` : ""}
   </div>
   <table>
     <thead><tr><th>config</th>${statuses.map((st) => `<th>${esc(st)}</th>`).join("")}</tr></thead>
@@ -925,11 +956,29 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
        shown results are the last successful build.${p._failure.buildurl ? ` <a href="${esc(p._failure.buildurl)}">build log</a>` : ""}</p>`
     : "";
 
+  // A seeded entry never faced the gate, so saying "propagated" of it would be a
+  // claim we did not make. Its bioccheck is null and its archs empty by
+  // construction — the tiles say where it came from instead of implying a verdict.
+  const seeded = prop && originOf(prop) === "bioconductor";
   const propHtml = prop
-    ? `<div class="tile"><b>${esc(prop.version)}</b><span>propagated ${age(prop.ts, now)}</span></div>
+    ? `<div class="tile"><b>${esc(prop.version)}</b><span>${seeded ? "seeded" : "propagated"} ${age(prop.ts, now)}</span></div>
        <div class="tile"><b>${prop.artifacts.length}</b><span>artifacts</span></div>
-       <div class="tile"><b>${checkCell(prop.bioccheck ?? "—")}</b><span>bioccheck at prop</span></div>`
+       ${seeded
+         ? `<div class="tile"><b>Bioconductor</b><span>origin — not gated here</span></div>`
+         : `<div class="tile"><b>${checkCell(prop.bioccheck ?? "—")}</b><span>bioccheck at prop</span></div>`}`
     : `<div class="tile"><b>—</b><span>not propagated</span></div>`;
+
+  const seededNote = seeded
+    ? `<p class="warn">This version was seeded from Bioconductor's own release build, not propagated
+       through this registry's gate: it builds in BBS and fails here. It is replaced the ordinary way,
+       when the maintainer bumps the version and r-universe builds it.</p>`
+    : "";
+
+  // Labelled a mirror because it is one: PRs against github.com/bioc/* go nowhere.
+  const src = prop?.meta?.git_url
+    ? `<p class="sub">source: <a href="${esc(prop.meta.git_url)}">${esc(prop.meta.git_url)}</a>
+       <span class="muted">(mirror of git.bioconductor.org — not a pull-request target)</span></p>`
+    : "";
 
   const artifacts = prop
     ? `<details><summary>propagated artifacts</summary>
@@ -962,7 +1011,8 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
 <p class="sub"><a href="/">← dashboard</a> · ${esc(universe)} · status ${esc(p._status ?? "?")} ·
   built ${p._created ? age(p._created, now) : "?"} · observed ${age(meta.ts, now)} ·
   <a href="https://${esc(universe)}.r-universe.dev/${encodeURIComponent(name)}">r-universe</a></p>
-${failure}
+${failure}${seededNote}
+${src}
 <div class="tiles">${propHtml}</div>
 <h2>current build jobs</h2>
 <div class="wrap"><table>
