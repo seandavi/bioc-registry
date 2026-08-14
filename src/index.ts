@@ -76,9 +76,14 @@ async function poll(universe: string, env: Env): Promise<string> {
 // GHA deletes job logs at ~90 days, which makes them the second unrecoverable
 // thing here after the artifacts. Capture runs on the cron and walks forward from
 // a stored high-water mark; see pendingJobIds for why one integer is enough state.
-// 50/run against a 15-minute cron is 4,800/day, comfortably over the ~1.5k/day of
-// new job ids observed per universe and well under GitHub's 5,000/hr for a token.
-const LOGS_PER_RUN = 50;
+// 200/run against a 15-minute cron is 19,200/day per universe, against ~1.5k/day
+// of new job ids — the surplus is what drains the backlog (see issue #4: capture
+// walks oldest-first, so until that changes throughput is the only lever).
+// Two ceilings this stays under: GitHub allows 5,000 req/hr per token and both
+// universes together spend 1,600; a cron invocation makes ~1,200 subrequests
+// (fetch + its redirect hop + one R2 put per log, twice over) against the
+// 10,000 default on Workers paid.
+const LOGS_PER_RUN = 200;
 
 async function captureLogs(universe: string, env: Env): Promise<string> {
   // Trimmed because the obvious way to set this secret — piping `gcloud secrets
