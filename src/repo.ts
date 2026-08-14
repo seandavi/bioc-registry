@@ -45,6 +45,19 @@ export function metaOf(p: Partial<Record<(typeof META_FIELDS)[number], string>> 
   return m;
 }
 
+// Keys whose bytes never change once written. Everything else — the state/
+// pointers, prop/*/index.json, the seed plan — is rewritten in place, and
+// serving those with a long immutable cache hands out a stale index.
+export const writeOnce = (key: string) => /^(obs|parquet|logs)\/|\/(cas|log|pending)\//.test(key);
+
+// Fresh metadata from an observation replaces what was stored, so a field the
+// package dropped upstream disappears here too. git_url is the exception: it
+// comes from the universe's .gitmodules rather than the observation, so a
+// wholesale replace would drop it every time /reindex runs.
+export function mergeMeta(fresh: Meta, existing?: Meta): Meta {
+  return existing?.git_url ? { ...fresh, git_url: existing.git_url } : { ...fresh };
+}
+
 export type PropIndex = Record<string, {
   version: string; sha256: string; ts: string;
   bioccheck?: string | null; artifacts: Artifact[]; desc?: Desc; meta?: Meta;

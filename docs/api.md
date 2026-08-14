@@ -123,6 +123,10 @@ Serves any object in the bucket by key (see [Storage keys](#storage-keys)).
 
 - Supports `Range` requests (returns `206` + `Content-Range`) and `HEAD` —
   this is what makes remote DuckDB/`httpfs` work against the parquet files.
+- Write-once objects (`obs/`, `parquet/`, `logs/`, `prop/*/cas/`, `prop/*/log/`,
+  `prop/*/pending/`) are served `immutable`. Everything rewritten in place —
+  the `state/` pointers, `prop/{universe}/index.json`, the seed files — is
+  served `no-store`, so a reader never gets a stale index.
 - `Access-Control-Allow-Origin: *`, so any web page or notebook can query it.
 
 ```bash
