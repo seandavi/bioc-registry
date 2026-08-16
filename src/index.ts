@@ -427,6 +427,61 @@ async function compactParquet(universe: string, env: Env): Promise<string> {
 const compact = (env: Env) =>
   UNIVERSES.map((u) => compactParquet(u, env).catch((e) => `${u}: compaction failed: ${e}`));
 
+// ---------- manifest backfill ----------
+// captureLogs writes a manifest alongside each log it captures, but it only ever
+// walks forward, so the ~52,000 logs already in the bucket would never get one —
+// reproducibility data for the last few days instead of for the whole archive,
+// which is the gap this project exists to not have.
+//
+// A one-time drain, and a cron pass rather than a maintenance route: it needs no
+// human to run it, adds no side-effecting GET, and reads only from our own R2, so
+// nothing here is racing an upstream expiry. It walks the key listing rather than
+// job ids from an observation, because logs exist for jobs that have long since
+// dropped out of the current one. The list cursor IS the state — when a page
+// comes back untruncated the walk is over and every later run no-ops.
+//
+// ponytail: 25 a run drains ~52k in ~11 days. Small because the only real cost is
+// CPU spent regexing logs that reach 9MB, and nothing is waiting on this.
+const MANIFESTS_PER_RUN = 25;
+
+async function backfillManifests(universe: string, env: Env): Promise<string> {
+  const stateKey = `state/${universe}/manifestbackfill`;
+  const st = await env.ARCHIVE.get(stateKey);
+  const state = st ? await st.json<{ cursor?: string; done?: boolean }>() : {};
+  if (state.done) return `${universe}: manifest backfill complete`;
+
+  const prefix = `logs/${universe}/`;
+  const page = await env.ARCHIVE.list({ prefix, limit: MANIFESTS_PER_RUN, cursor: state.cursor });
+  let wrote = 0;
+  for (const o of page.objects) {
+    const job = o.key.slice(prefix.length).replace(/\.txt$/, "");
+    // A key that is not a job id writes nothing rather than a garbage manifest.
+    if (!/^\d+$/.test(job)) continue;
+    const log = await env.ARCHIVE.get(o.key);
+    if (!log) continue;
+    const manifest = buildManifest(await log.text());
+    // Same rule as capture: an empty manifest would read as "no dependencies"
+    // rather than "this log had no install section".
+    if (!manifest.image && !Object.keys(manifest.deps).length) continue;
+    // Rewritten unconditionally where capture already wrote one — the input is the
+    // same log, so the output is identical, and a HEAD per key to find out would
+    // cost more than the put.
+    await env.ARCHIVE.put(`builds/${universe}/${job}.json`, JSON.stringify(manifest), {
+      httpMetadata: { contentType: "application/json" },
+    });
+    wrote++;
+  }
+  await env.ARCHIVE.put(
+    stateKey,
+    JSON.stringify(page.truncated ? { cursor: page.cursor } : { done: true })
+  );
+  return `${universe}: manifests ${wrote}/${page.objects.length}` +
+    (page.truncated ? "" : " (backfill complete)");
+}
+
+const backfill = (env: Env) =>
+  UNIVERSES.map((u) => backfillManifests(u, env).catch((e) => `${u}: manifest backfill failed: ${e}`));
+
 // ---------- propagation ----------
 // Gate: build succeeded, and checks pass on AT LEAST ONE architecture (linux,
 // mac, windows) — per-family verdicts from the BBS-equivalent gating jobs, see
@@ -1354,7 +1409,9 @@ const finish = (res: Response) => {
 // infer the type of a binding referenced inside its own initializer.
 const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<Response> } = {
   async scheduled(_ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(Promise.all([...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env)]));
+    ctx.waitUntil(Promise.all([
+      ...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env), ...backfill(env),
+    ]));
   },
   async fetch(req: Request, env: Env): Promise<Response> {
     return finish(await handler.route(req, env));
