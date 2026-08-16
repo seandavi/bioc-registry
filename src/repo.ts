@@ -48,7 +48,8 @@ export function metaOf(p: Partial<Record<(typeof META_FIELDS)[number], string>> 
 // Keys whose bytes never change once written. Everything else — the state/
 // pointers, prop/*/index.json, the seed plan — is rewritten in place, and
 // serving those with a long immutable cache hands out a stale index.
-export const writeOnce = (key: string) => /^(obs|parquet|logs)\/|\/(cas|log|pending)\//.test(key);
+export const writeOnce = (key: string) =>
+  /^(obs|parquet|logs|checks|builds)\/|\/(cas|log|pending)\//.test(key);
 
 // Fresh metadata from an observation replaces what was stored, so a field the
 // package dropped upstream disappears here too. git_url is the exception: it
@@ -571,20 +572,119 @@ export function planCompaction(
     byDay.set(m[1], [...(byDay.get(m[1]) ?? []), o]);
   }
   for (const day of [...byDay.keys()].sort()) {
-    const sources: string[] = [];
-    let total = 0;
-    for (const o of byDay.get(day)!.sort((a, b) => a.key.localeCompare(b.key))) {
-      if (o.size > maxBytes || total + o.size > maxBytes) continue;
-      sources.push(o.key);
-      total += o.size;
+    const files = byDay.get(day)!.sort((a, b) => a.key.localeCompare(b.key));
+    // Advancing `from` is what keeps a day from wedging. A merge sorts first (its
+    // name carries the day's earliest timestamp) and can sit just under the budget
+    // — 2.5MB of a 3MB cap — leaving no room for any sibling, so the greedy pass
+    // anchored at index 0 yields one source and the day is skipped forever. Both
+    // universes stalled that way on the pre-delta days. Starting past it merges the
+    // tail into a second -m instead; a day may hold several, which reads the same.
+    for (let from = 0; from < files.length; from++) {
+      const sources: string[] = [];
+      let total = 0;
+      for (const o of files.slice(from)) {
+        if (o.size > maxBytes || total + o.size > maxBytes) continue;
+        sources.push(o.key);
+        total += o.size;
+      }
+      if (sources.length < 2) continue;
+      const dir = sources[0].slice(0, sources[0].lastIndexOf("/") + 1);
+      // Basenames start with the observation timestamp: 2026-08-09T06:00:55.907Z-…
+      return { day, sources, out: `${dir}${sources[0].slice(dir.length, dir.length + 24)}-m.parquet` };
     }
-    if (sources.length < 2) continue;
-    const dir = sources[0].slice(0, sources[0].lastIndexOf("/") + 1);
-    // Basenames start with the observation timestamp: 2026-08-09T06:00:55.907Z-…
-    return { day, sources, out: `${dir}${sources[0].slice(dir.length, dir.length + 24)}-m.parquet` };
   }
   return null;
 }
+
+// ---------- build manifest ----------
+// The job log is the only place a build's inputs are written down: the image it
+// ran in, and the resolved version of every dependency it installed. Nothing else
+// has them — r-universe's _rundeps is names without versions, and the check
+// artifact records only the R revision and the OS. That makes this the difference
+// between "the check failed" and "the check can be re-run", since a check that
+// broke without the package changing broke because a dependency moved.
+//
+// Bioconductor's build system publishes the equivalent per builder as
+// R-instpkgs.html — and 404s it as soon as a release is archived, so the versions
+// behind an archived report are already unrecoverable there.
+//
+// Extracted once at capture rather than left in place, because the alternative is
+// every consumer regexing a log that runs to 9MB.
+export type BuildManifest = { image?: string; repos: string[]; deps: Record<string, string> };
+
+export function buildManifest(log: string): BuildManifest {
+  // Name and digest are captured independently: a job pulls one image, and the
+  // "Digest:" line docker prints does not repeat the name next to it.
+  const image = /((?:ghcr|docker)\.io\/[a-z0-9._\-/]+):[a-z0-9._-]+/i.exec(log)?.[1];
+  const digest = /Digest: (sha256:[a-f0-9]{64})/.exec(log)?.[1];
+  const deps: Record<string, string> = {};
+  const repos = new Set<string>();
+  // Dependencies arrive as plain tarball downloads, so each URL carries both the
+  // resolved version and the repo it resolved from. The repo matters on its own:
+  // p3m's ".../latest" is a moving snapshot, so it pins nothing and the versions
+  // here are the only record of what "latest" meant that day.
+  for (const m of log.matchAll(
+    /(https?:\/\/[\w.\-/]+?)\/src\/contrib\/([A-Za-z][\w.]*)_([0-9][\w.\-]*)\.tar\.gz/g
+  )) {
+    repos.add(m[1]);
+    deps[m[2]] = m[3];
+  }
+  return {
+    ...(image && digest ? { image: `${image}@${digest}` } : {}),
+    repos: [...repos].sort(),
+    deps,
+  };
+}
+
+// ---------- zip central directory ----------
+// A zip's index sits at the END of the file, which is what makes fetching part of
+// one possible: read the last slab, find the end-of-central-directory record, and
+// every entry's name, size and byte offset falls out without touching the rest. A
+// GHA check artifact is up to 7.6MB of built package tarball wrapped around ~65KB
+// of logs, and the logs are the only part worth keeping.
+//
+// ponytail: no zip64. Offsets go 0xFFFFFFFF past 4GB or 65,535 entries, and these
+// artifacts are single-digit MB with under ten files. Add it if that ever changes.
+export type ZipEntry = { name: string; method: number; compressed: number; size: number; offset: number };
+
+// `tailStart` is the absolute offset `tail` begins at, so a directory that fell
+// outside the slab can be detected rather than misread. Null means "fetch more".
+export function parseZipCentral(tail: Uint8Array, tailStart: number): ZipEntry[] | null {
+  const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+  const u16 = (p: number) => dv.getUint16(p, true);
+  const u32 = (p: number) => dv.getUint32(p, true);
+  let eocd = -1;
+  // Scanning backwards finds the real record first when a stored file happens to
+  // contain the signature bytes.
+  for (let p = tail.length - 22; p >= 0; p--)
+    if (u32(p) === 0x06054b50) { eocd = p; break; }
+  if (eocd < 0) return null;
+  const cdSize = u32(eocd + 12);
+  const start = u32(eocd + 16) - tailStart;
+  if (start < 0 || start + cdSize > tail.length) return null;
+  const entries: ZipEntry[] = [];
+  const dec = new TextDecoder();
+  let p = start;
+  while (p + 46 <= start + cdSize && u32(p) === 0x02014b50) {
+    const n = u16(p + 28);
+    entries.push({
+      name: dec.decode(tail.subarray(p + 46, p + 46 + n)),
+      method: u16(p + 10),
+      compressed: u32(p + 20),
+      size: u32(p + 24),
+      offset: u32(p + 42),
+    });
+    p += 46 + n + u16(p + 30) + u16(p + 32); // + extra field + comment
+  }
+  return entries;
+}
+
+// Everything that is not the built package. The tarball is ~99% of an artifact's
+// bytes and, for anything that propagated, is already in the CAS; the rest is text
+// worth keeping whatever upstream adds to it next — today that is 00check.log,
+// 00install.out, 00BiocCheck.log, output.log, build.log and the *.Rout transcripts.
+export const isLogEntry = (name: string) =>
+  !name.endsWith("/") && !/\.(tar\.gz|tgz|zip)$/i.test(name);
 
 // GHA job ids are monotonically increasing, so one high-water mark is the entire
 // "already captured" state — no per-job HEAD (26k+ per snapshot) and no key listing.
@@ -602,4 +702,24 @@ export function pendingJobIds(
       if (Number.isFinite(n) && n > cursor) ids.add(n);
     }
   return [...ids].sort((a, b) => a - b).slice(0, limit);
+}
+
+// Same forward-only walk, but the artifact id has to ride along: check logs are
+// addressed by artifact while the cursor is over job ids. A job with no artifact
+// id is skipped rather than counted — there is nothing to fetch for it.
+export function pendingArtifacts(
+  pkgs: { _jobs?: { job?: number; artifact?: string }[] }[],
+  cursor: number,
+  limit: number
+): { job: number; artifact: string }[] {
+  const found = new Map<number, string>();
+  for (const p of pkgs)
+    for (const j of p._jobs ?? []) {
+      const n = Number(j.job);
+      if (Number.isFinite(n) && n > cursor && j.artifact) found.set(n, j.artifact);
+    }
+  return [...found]
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, limit)
+    .map(([job, artifact]) => ({ job, artifact }));
 }
