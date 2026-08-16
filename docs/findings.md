@@ -120,6 +120,86 @@ shows. Remedies, in order of leverage:
 - GHA check-log artifacts require authentication and expire; ~8% of sampled
   jobs had no artifact uploaded at all. Log capture has a real deadline.
 
+### 7. The job log is not the check log — 2026-08-15
+
+The GHA **job** log is the runner's own output: docker pulls, dependency
+installs, compiler noise. It does not contain R CMD check's verdict. Measured on
+a 9.1MB one (ClustIRR): six `* checking` lines and no check section at all.
+
+R CMD check's output is in the artifact each job uploads, and so is everything
+else worth reading — `00check.log`, `00install.out`, `{pkg}-Ex.Rout`,
+`tests/*.Rout{,.fail}`, plus `00BiocCheck.log` on the `bioc-checks` config and
+`build.log` on wasm. r-universe's API has none of it: `_jobs[]` carries only
+`job/time/config/r/check/artifact`, and `_assets` is citation files and the
+manual.
+
+Verified across all 19 configs. The 15 platform configs each produce the full
+set. Three do not, correctly — `source` builds the tarball (its build output is
+the job log), `bioc-checks` runs BiocCheck rather than R CMD check, and
+`wasm-release` compiles without checking.
+
+**The one real hole is `FAIL`/`FAILURE`.** Broken down by verdict, missing
+artifacts are not spread around at all:
+
+| check | jobs | no artifact |
+|---|---|---|
+| OK / NOTE / WARNING | 24,115 | 14 |
+| ERROR | 2,279 | 0 |
+| FAIL | 403 | **403 (100%)** |
+| FAILURE | 76 | **76 (100%)** |
+
+`ERROR` means check ran and reported; the artifact is always there. `FAIL` means
+the runner died before uploading, so no check log was ever produced and the job
+log is the only evidence. That is why `captureLogs` is not superseded by
+`captureChecks` and both must keep running.
+
+Artifact anatomy matters for ingest: up to 7.6MB of built package wrapped around
+~65KB of text (24 jobs sampled: mean 65KB, max 356KB). Fetching them whole would
+be ~11GB/day, so only the text entries are pulled — see the range trap in the
+operational notes.
+
+### 8. Reproducibility: what BBS publishes, and where we now stand — 2026-08-15
+
+A BBS package report links four things beyond the logs, framed by Bioconductor
+itself as the reproduction kit ("Use the following Renviron settings to
+reproduce errors and warnings"): `R-instpkgs.html` (every installed package with
+version — 829KB, 4,989 packages), `NodeInfo.html`, `Renviron.bioc`, and the git
+provenance.
+
+Two properties of that archive are worth knowing. There are no dated reports,
+only `bioc-LATEST`, so BBS keeps one snapshot and overwrites it. And for an
+archived release the package page survives but **`R-instpkgs.html` 404s** — the
+versions behind an archived report are already unrecoverable upstream.
+
+Component by component, we now match or beat it except in one place:
+
+| component | source | status |
+|---|---|---|
+| R version | check log: `R Under development (unstable) (2026-08-01 r90334)` | **better** — svn revision, not `4.6.1` |
+| base environment | job log: `Digest: sha256:…` | **better** — a digest is reconstitutable; NodeInfo describes a machine you cannot rebuild |
+| dependency versions | job log tarball URLs → `builds/{u}/{job}.json` | matched (126 pairs for ClustIRR vs 114 in `_rundeps`) |
+| system libraries | `_sysdeps`, now in `FIELDS` | matched |
+| platform / OS / check flags | check log header | matched |
+| source pin | `RemoteUrl/Ref/Sha`, `_commit` | matched |
+| check env vars | — | **missing**: r-universe publishes no `Renviron.bioc` equivalent, and no `_R_CHECK_*` appears in any log. The image digest covers what the image sets; the residual is the workflow yaml in `r-universe/{universe}` |
+
+The dependency versions exist *only* in the job log, as tarball download URLs
+(`p3m.dev/all/__linux__/resolute/latest/src/contrib/abind_1.4-8.tar.gz`). Note
+that repo is a moving `latest`, so the URL pins nothing — the parsed versions
+are the only record of what it meant that day. Parsed once at capture into
+`builds/`, because the alternative is every consumer regexing 9MB.
+
+Field selection was made on **volatility**, not size: `_downloads` and `_score`
+are small but change continuously, and would turn ~16 observations a day into 96
+full 27MB ones. `_help` (29MB) and `_exports` (5.8MB) are stable but would more
+than double the observation to archive what a consumer can ask r-universe for
+directly. The twelve fields added cost +1.80MB on 25.87MB (+7%).
+
+One of them is worth singling out: **`_devurl`** (1,432 of 2,419 packages) is
+the maintainer's own development repository, not the read-only
+`github.com/bioc/*` mirror `git_url` points at. It is the only field in the
+system that says where a fix could actually be sent.
+
 ## The current gate
 
 A package version propagates when **all** of:
@@ -221,6 +301,41 @@ so nothing here requires this system to read it back.
 - The `?fields=` parameter cuts `/api/packages` from ~70 MB to ~15 MB and, more
   importantly, drops volatile fields (`_score`, `_stars`) that would otherwise
   churn the change digest on every poll.
+- **Range works on GHA artifacts, but not the suffix form.** The API redirects to
+  Azure blob storage, which answers `Range: bytes=200000-263172` with a proper
+  `206` — and answers `Range: bytes=-65536` with a `200` and the entire file. A
+  suffix range therefore *looks* like it works while silently downloading
+  everything, so `captureChecks` does a `HEAD` for the length first.
+- **Compaction wedged itself on the pre-delta days.** `planCompaction` anchored
+  its greedy pass at index 0, and a day's `-m.parquet` sorts first because its
+  name carries the earliest timestamp. At 2.5MB against a 3MB budget it left
+  503KB, less than any sibling (smallest 657KB), so the day yielded one source
+  and was skipped forever — 08-12 and 08-13 sat untouched for days in both
+  universes. Fixed by advancing the start index past a budget-hogging head file.
+  Delta rows shrank per-observation files from ~657KB to ~2.8KB, so future days
+  are nowhere near the budget; only the legacy days were affected.
+- **Bioconductor pulls the source tarball of a deprecated package but leaves the
+  binaries.** 39 of 41 remaining `bioc` seed-plan packages and 30 of 31 in
+  `bioc-release` 404 on `src/contrib/{pkg}_{ver}.tar.gz` while their `bin/`
+  copies still resolve. `/seed` correctly declines them — an entry with no source
+  would advertise a file that 404s on install — so the seed walk completing with
+  "seeded 0" is the right outcome, not a failure. Those packages are also why
+  they fail in r-universe.
+
+### Reproducing a check locally
+
+Everything needed is addressable by job id:
+
+```bash
+B=https://bioc-registry.seandavi.workers.dev
+JOB=91651624895
+curl -s $B/builds/bioc/$JOB | jq          # image digest, repos, dependency versions
+curl -s $B/checks/bioc/$JOB | jq -r '."00check.log"'   # the verdict and failing sections
+curl -s $B/logs/bioc/$JOB                 # the runner's own output
+```
+
+The observation record supplies the rest: `RemoteUrl`/`RemoteSha` for the source
+pin, `_sysdeps` for system libraries, `_devurl` for where a fix would go.
 
 ## Open questions for the team
 
@@ -234,5 +349,9 @@ so nothing here requires this system to read it back.
 4. Seeding: should the propagation index be seeded from production 3.23/3.24
    (`PACKAGES`) so the propagated repo starts at parity with what users have,
    with the gate governing changes from there?
-5. A GitHub token for the worker would unlock check-log capture before logs
-   expire — fine-grained, public-repo read-only.
+5. ~~A GitHub token for the worker would unlock check-log capture before logs
+   expire~~ — done. The token is in place and both captures run on the cron; see
+   §7 for what the two corpora actually contain.
+6. The `Renviron.bioc` gap (§8) is the last reproducibility component we cannot
+   source. Worth asking Jeroen whether r-universe's check environment could be
+   published, or whether pinning the workflow yaml by commit is the answer.

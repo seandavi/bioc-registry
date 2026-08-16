@@ -4,7 +4,8 @@ import { parquetReadObjects } from "hyparquet";
 import {
   Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
   describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
-  parseGitmodules, parseRepoDir, passingFamilies, pendingJobIds, planCompaction,
+  parseGitmodules, parseRepoDir, passingFamilies, pendingArtifacts, pendingJobIds,
+  planCompaction, parseZipCentral, isLogEntry, buildManifest,
   invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
   viewsDcf, writeOnce, JobRow, RowState,
 } from "./repo.js";
@@ -27,7 +28,25 @@ const FIELDS =
   // Descriptive metadata for VIEWS and the site's landing pages. All of these
   // change only when the package itself changes, so the digest stays quiet.
   "Title,Description,Author,Maintainer,URL,BugReports,SystemRequirements,Date," +
-  "biocViews,VignetteBuilder,_vignettes";
+  "biocViews,VignetteBuilder,_vignettes," +
+  // What it takes to reproduce a check, and what the check artifact does not say.
+  // _sysdeps carries system library versions (libtbb12 2022.3.0-2, …), _distro the
+  // builder's Ubuntu codename, and RemoteUrl/Ref/Sha the exact source pin — the
+  // 40-char sha, where _commit.id is abbreviated. Bioconductor's build system
+  // publishes the equivalent as NodeInfo + R-instpkgs, and drops R-instpkgs the
+  // moment a release is archived, so mirroring it here is the whole point.
+  "_sysdeps,_distro,RemoteUrl,RemoteRef,RemoteSha," +
+  // _devurl is the maintainer's actual development repository (present for 1,432
+  // of 2,419), as opposed to git_url's read-only github.com/bioc mirror. It is the
+  // only field here that says where a fix could be sent.
+  "_upstream,_devurl," +
+  // _bioccheck is BiocCheck's counts — {error, warning, note} — where the index's
+  // own bioccheck is just the job's pass/fail verdict.
+  "_bioccheck,_bioc,_filesize,_cranurl,Config/Bioconductor/UnsupportedPlatforms";
+// Deliberately excluded: _downloads and _score change continuously, so they would
+// make every poll a fresh digest and turn ~16 observations a day into 96. _help
+// (29MB) and _exports (5.8MB) would more than double the observation to archive
+// what an MCP server can ask r-universe for at query time.
 
 export interface Env {
   ARCHIVE: R2Bucket;
@@ -81,10 +100,10 @@ async function poll(universe: string, env: Env): Promise<string> {
 // 200/run against a 15-minute cron is 19,200/day per universe, against ~1.5k/day
 // of new job ids — the surplus is what drains the backlog (see issue #4: capture
 // walks oldest-first, so until that changes throughput is the only lever).
-// Two ceilings this stays under: GitHub allows 5,000 req/hr per token and both
-// universes together spend 1,600; a cron invocation makes ~1,200 subrequests
-// (fetch + its redirect hop + one R2 put per log, twice over) against the
-// 10,000 default on Workers paid.
+// Two ceilings this stays under, now shared with captureChecks below: GitHub
+// allows 5,000 req/hr per token, and the two captures over both universes spend
+// ~1,600 + ~800; a cron invocation makes ~1,200 subrequests here and ~1,600 there,
+// against the 10,000 default on Workers paid.
 const LOGS_PER_RUN = 200;
 
 async function captureLogs(universe: string, env: Env): Promise<string> {
@@ -118,7 +137,16 @@ async function captureLogs(universe: string, env: Env): Promise<string> {
     // Anything else terminal (404/410 = already expired upstream) is unrecoverable,
     // so let the mark pass it rather than wedging the cursor on a dead job.
     if (gh.ok) {
-      await env.ARCHIVE.put(`logs/${universe}/${job}.txt`, await gh.arrayBuffer());
+      const log = await gh.text();
+      await env.ARCHIVE.put(`logs/${universe}/${job}.txt`, log);
+      const manifest = buildManifest(log);
+      // Skipped when it found nothing: a log with no install section says nothing
+      // about the build, and an empty manifest would read as "no dependencies"
+      // rather than "not recorded".
+      if (manifest.image || Object.keys(manifest.deps).length)
+        await env.ARCHIVE.put(`builds/${universe}/${job}.json`, JSON.stringify(manifest), {
+          httpMetadata: { contentType: "application/json" },
+        });
       saved++;
     }
     mark = job;
@@ -127,10 +155,143 @@ async function captureLogs(universe: string, env: Env): Promise<string> {
   return `${universe}: captured ${saved}/${ids.length} logs, cursor ${mark}`;
 }
 
+// ---------- check-log capture ----------
+// captureLogs stores the GHA *job* log: the runner's own output — docker pulls,
+// dependency installs, compiler noise. A 9.1MB one measured here holds six
+// "* checking" lines and no check verdict at all. What a maintainer actually reads
+// is in the job's uploaded artifact:
+//
+//   00check.log      R CMD check's verdict and every failing section
+//   00install.out    the build log for that platform
+//   *-Ex.Rout        the example transcript (.fail when examples errored)
+//   tests/*.Rout     the test transcript (.Rout.fail when tests errored)
+//   00BiocCheck.log  BiocCheck's report, on the bioc-checks config
+//   build.log        wasm builds
+//
+// These expire with the artifact — the observation's _expires is the deadline,
+// ~100 days out — so a missed one is unrecoverable, exactly like a job log.
+//
+// The artifact is a zip holding up to 7.6MB of built package around ~65KB of that
+// text (measured across 24 jobs: mean 65KB, max 356KB). Fetching them whole would
+// be ~11GB/day, so only the text entries are pulled: HEAD for the length, one
+// range for the central directory at the end, one per wanted entry. The blob host
+// the API redirects to honours ranges but NOT the suffix form — `bytes=-65536`
+// comes back 200 with the entire file — which is why the length is looked up
+// rather than assumed.
+const CHECKS_PER_RUN = 100;
+const ZIP_TAIL = 64 * 1024;
+// A local file header repeats the name and carries its own extra field, so the
+// data does not begin where the central directory alone can say. Over-fetching by
+// this much and reading the real lengths costs ~1KB an entry against a second
+// round trip for every one of them.
+const ZIP_HEADER_SLACK = 1024;
+// Upstream text, so it needs a ceiling: one pathological transcript must not take
+// down the isolate that is also running poll and compaction.
+const MAX_LOG_BYTES = 4_000_000;
+
+const ghHeaders = (token: string) => ({ "user-agent": "bioc-registry", authorization: `Bearer ${token}` });
+
+// Null for anything terminal (expired, missing, malformed). Throws only when the
+// run should stop and retry later, which the caller turns into a break.
+async function fetchCheckLogs(
+  universe: string, artifact: string, token: string
+): Promise<Record<string, string> | null> {
+  // The API answers 302 to a signed blob URL, and that URL — not the API — is
+  // what serves ranges, so the hop is taken by hand instead of followed.
+  const res = await fetch(
+    `https://api.github.com/repos/r-universe/${universe}/actions/artifacts/${artifact}/zip`,
+    { headers: ghHeaders(token), redirect: "manual" }
+  );
+  if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0")
+    throw new Error("rate limited");
+  // 404/410 is terminal — the artifact expired or never existed — and the cursor
+  // should move past it. Anything else without a redirect is NOT terminal, and
+  // must throw: a silent null there would march the cursor through the whole
+  // backlog marking every job unavailable, burning the one chance to capture it.
+  if (res.status === 404 || res.status === 410) return null;
+  const url = res.headers.get("location");
+  if (!url) throw new Error(`artifact ${artifact}: no redirect (HTTP ${res.status})`);
+
+  const head = await fetch(url, { method: "HEAD" });
+  const total = Number(head.headers.get("content-length") ?? 0);
+  if (!total) return null;
+
+  const from = Math.max(0, total - ZIP_TAIL);
+  const tail = await fetch(url, { headers: { range: `bytes=${from}-${total - 1}` } });
+  if (!tail.ok) return null;
+  const entries = parseZipCentral(new Uint8Array(await tail.arrayBuffer()), from);
+  if (!entries) return null;
+
+  const logs: Record<string, string> = {};
+  for (const e of entries) {
+    if (!isLogEntry(e.name) || e.size > MAX_LOG_BYTES) continue;
+    const end = Math.min(total - 1, e.offset + 30 + ZIP_HEADER_SLACK + e.compressed);
+    const part = await fetch(url, { headers: { range: `bytes=${e.offset}-${end}` } });
+    if (!part.ok) continue;
+    const buf = new Uint8Array(await part.arrayBuffer());
+    const start = 30 + (buf[26] | (buf[27] << 8)) + (buf[28] | (buf[29] << 8));
+    if (start + e.compressed > buf.length) continue; // slack was not enough
+    const data = buf.subarray(start, start + e.compressed);
+    const bytes = e.method === 0
+      ? data
+      : new Uint8Array(
+          await new Response(
+            new Response(data).body!.pipeThrough(new DecompressionStream("deflate-raw"))
+          ).arrayBuffer()
+        );
+    // Flattened: "GeneGA.Rcheck/00check.log" and "tests/testthat.Rout.fail" are
+    // unambiguous by basename, and the .Rcheck prefix is just the package name.
+    logs[e.name.split("/").pop()!] = new TextDecoder().decode(bytes);
+  }
+  return logs;
+}
+
+async function captureChecks(universe: string, env: Env): Promise<string> {
+  const token = env.GITHUB_TOKEN?.trim();
+  if (!token) return `${universe}: check capture skipped (no GITHUB_TOKEN)`;
+  const last = await env.ARCHIVE.get(`state/${universe}/latest`);
+  if (!last) return `${universe}: check capture skipped (no observation yet)`;
+  const { key } = await last.json<{ key: string }>();
+  const obs = await env.ARCHIVE.get(key);
+  if (!obs) return `${universe}: check capture skipped (${key} missing)`;
+
+  const cur = await env.ARCHIVE.get(`state/${universe}/checkcursor`);
+  const cursor = cur ? (await cur.json<{ job: number }>()).job : 0;
+  const jobs = pendingArtifacts(await obs.json(), cursor, CHECKS_PER_RUN);
+  if (!jobs.length) return `${universe}: check logs current at ${cursor}`;
+
+  let mark = cursor, saved = 0, empty = 0;
+  for (const { job, artifact } of jobs) {
+    let logs: Record<string, string> | null;
+    try {
+      logs = await fetchCheckLogs(universe, artifact, token);
+    } catch {
+      break; // rate limited or transient: stop without advancing, retry next run
+    }
+    if (logs && Object.keys(logs).length) {
+      await env.ARCHIVE.put(`checks/${universe}/${job}.json`, JSON.stringify(logs), {
+        httpMetadata: { contentType: "application/json" },
+      });
+      saved++;
+    } else {
+      // Expired or artifact-less: unrecoverable, so let the mark move past it
+      // rather than wedging the cursor on a job that will never yield anything.
+      empty++;
+    }
+    mark = job;
+  }
+  if (mark > cursor)
+    await env.ARCHIVE.put(`state/${universe}/checkcursor`, JSON.stringify({ job: mark }));
+  return `${universe}: captured ${saved} check logs${empty ? `, ${empty} unavailable` : ""}, cursor ${mark}`;
+}
+
 // Capture is best-effort: a GitHub outage must not fail the poll it rides with,
-// and the cursor means the skipped ids are simply picked up next run.
+// and the cursors mean the skipped ids are simply picked up next run.
 const capture = (env: Env) =>
-  UNIVERSES.map((u) => captureLogs(u, env).catch((e) => `${u}: capture failed: ${e}`));
+  UNIVERSES.flatMap((u) => [
+    captureLogs(u, env).catch((e) => `${u}: capture failed: ${e}`),
+    captureChecks(u, env).catch((e) => `${u}: check capture failed: ${e}`),
+  ]);
 
 // ---------- parquet ----------
 
@@ -699,6 +860,17 @@ type FullPkg = {
   // The workflow run that _jobs came from. Needed to link a job on github.com,
   // which has no URL form that takes a job id alone.
   _buildurl?: string;
+  // Reproduction inputs. _sysdeps is only on the ~16% of packages that need a
+  // system library; _devurl only where the maintainer declared one.
+  _sysdeps?: { name?: string; package?: string; version?: string; source?: string; shlib?: string }[];
+  _distro?: string;
+  RemoteUrl?: string; RemoteRef?: string; RemoteSha?: string;
+  _upstream?: string; _devurl?: string;
+  _bioccheck?: { error?: number; warning?: number; note?: number };
+  _bioc?: { branch?: string; version?: string; bioc?: string }[];
+  _filesize?: number;
+  _cranurl?: string | false;
+  "Config/Bioconductor/UnsupportedPlatforms"?: string;
 };
 type Pkg = { Package: string; _jobs?: { config: string; check: string }[] };
 
@@ -1358,6 +1530,41 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
         `log not captured (capture only walks forward from when it was switched on).\n` +
           `While GHA still has it: https://github.com/r-universe/${u}/runs/${job}\n`,
         { status: 404, headers: text }
+      );
+    }
+    if (pathname.startsWith("/checks/")) {
+      const [u, job] = pathname.slice(8).split("/");
+      if (!UNIVERSES.includes(u) || !/^\d+$/.test(job ?? ""))
+        return new Response("not found", { status: 404 });
+      const json = { "content-type": "application/json" };
+      const obj = await env.ARCHIVE.get(`checks/${u}/${job}.json`);
+      // One object per job rather than one per file: a caller diagnosing a failure
+      // wants the check log and the transcript it points at together, and it makes
+      // capture one R2 write instead of five.
+      if (obj) return new Response(obj.body, { headers: { ...json, "cache-control": IMMUTABLE } });
+      return new Response(
+        JSON.stringify({
+          error: "not captured",
+          detail: "capture walks forward from when it was switched on; artifacts expire upstream at ~100 days",
+          job: `https://github.com/r-universe/${u}/runs/${job}`,
+        }),
+        { status: 404, headers: json }
+      );
+    }
+    if (pathname.startsWith("/builds/")) {
+      const [u, job] = pathname.slice(8).split("/");
+      if (!UNIVERSES.includes(u) || !/^\d+$/.test(job ?? ""))
+        return new Response("not found", { status: 404 });
+      const json = { "content-type": "application/json" };
+      const obj = await env.ARCHIVE.get(`builds/${u}/${job}.json`);
+      if (obj) return new Response(obj.body, { headers: { ...json, "cache-control": IMMUTABLE } });
+      return new Response(
+        JSON.stringify({
+          error: "not captured",
+          detail: "derived from the job log, so it exists only where /logs does",
+          log: `/logs/${u}/${job}`,
+        }),
+        { status: 404, headers: json }
       );
     }
     if (pathname === "/sql") {

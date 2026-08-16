@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { described, describe, findArtifact, gateFamily, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, passingFamilies, matchSel, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
+import { buildManifest, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -165,6 +165,110 @@ test("planCompaction merges the oldest closed day, never today, within a byte bu
 
   // Only one file fits: no merge at all rather than a pointless rewrite.
   assert.equal(planCompaction([o("2026-08-09", "01:00:00", 99999), o("2026-08-09", "06:00:00")], "2026-08-11", 1000), null);
+
+  // The stall seen in production: a previous merge sorts first and sits just under
+  // the budget, so nothing else fits beside it and the day is never touched again.
+  // The tail must merge into a second -m rather than the day wedging.
+  const nearFull = [
+    { key: k("2026-08-09", "01:00:00").replace(/-abc\.parquet$/, "-m.parquet"), size: 900 },
+    o("2026-08-09", "06:00:00", 300), o("2026-08-09", "12:00:00", 300),
+  ];
+  const tail = planCompaction(nearFull, "2026-08-11", 1000)!;
+  assert.deepEqual(tail.sources, [k("2026-08-09", "06:00:00"), k("2026-08-09", "12:00:00")]);
+  assert.equal(tail.out, "parquet/jobs/universe=bioc/dt=2026-08-09/2026-08-09T06:00:00.000Z-m.parquet");
+
+  // …and once every survivor is a near-full merge, the day is genuinely done.
+  assert.equal(
+    planCompaction(
+      [{ key: k("2026-08-09", "01:00:00"), size: 900 }, { key: k("2026-08-09", "06:00:00"), size: 900 }],
+      "2026-08-11", 1000
+    ),
+    null
+  );
+});
+
+// A real zip built by `zip -X`: a deflated log, a deflated "tarball" standing in
+// for the built package, and a stored entry. 412 bytes, so it doubles as the
+// short-file case where the whole archive is smaller than the tail slab.
+const FIXTURE_ZIP =
+  "UEsDBBQAAAAIAKN8D12BzVauMgAAAEQBAAAWAAAAUGtnLlJjaGVjay8wMGNoZWNrLmxvZ9NSSM5ITc7OzEtXSK1I" +
+  "zC3ISS1W0NPTU3ANCvIP4goqzctDkUpLzMxJTeHSGtWFpAsAUEsDBBQAAAAIAKN8D10TLUMbBwAAACwBAAAQAAAA" +
+  "UGtnXzEuMC4wLnRhci5nequoGAXEAgBQSwMECgAAAAAAo3wPXeKcU6UHAAAABwAAAAsAAABwa2dkYXRhLnR4dHN0" +
+  "b3JlZApQSwECHgMUAAAACACjfA9dgc1WrjIAAABEAQAAFgAAAAAAAAABAAAAoIEAAAAAUGtnLlJjaGVjay8wMGNo" +
+  "ZWNrLmxvZ1BLAQIeAxQAAAAIAKN8D10TLUMbBwAAACwBAAAQAAAAAAAAAAEAAACggWYAAABQa2dfMS4wLjAudGFy" +
+  "Lmd6UEsBAh4DCgAAAAAAo3wPXeKcU6UHAAAABwAAAAsAAAAAAAAAAAAAAKCBmwAAAHBrZ2RhdGEudHh0UEsFBgAA" +
+  "AAADAAMAuwAAAMsAAAAAAA==";
+
+test("parseZipCentral reads the directory without the rest of the archive", () => {
+  const zip = Uint8Array.from(atob(FIXTURE_ZIP), (c) => c.charCodeAt(0));
+  const entries = parseZipCentral(zip, 0)!;
+  assert.deepEqual(entries.map((e) => e.name),
+    ["Pkg.Rcheck/00check.log", "Pkg_1.0.0.tar.gz", "pkgdata.txt"]);
+  assert.deepEqual(entries.map((e) => [e.method, e.compressed, e.size, e.offset]),
+    [[8, 50, 324, 0], [8, 7, 300, 102], [0, 7, 7, 155]], "deflated and stored both read");
+
+  // The built package is ~99% of a real artifact and must not be fetched.
+  assert.deepEqual(entries.filter((e) => isLogEntry(e.name)).map((e) => e.name),
+    ["Pkg.Rcheck/00check.log", "pkgdata.txt"]);
+
+  // The point of the whole thing: given only the tail, the offsets still resolve,
+  // so the caller can range-fetch the entries it wants out of a 7.6MB archive.
+  const from = 150; // directory starts at 203, so this slab holds it and nothing else
+  const fromTail = parseZipCentral(zip.subarray(from), from)!;
+  assert.deepEqual(fromTail.map((e) => e.offset), [0, 102, 155]);
+
+  // A slab that misses part of the directory must say so rather than return half
+  // of it — the caller re-fetches a larger one.
+  assert.equal(parseZipCentral(zip.subarray(340), 340), null, "directory truncated");
+  assert.equal(parseZipCentral(zip.subarray(0, 100), 0), null, "no end-of-directory record");
+});
+
+// Shaped like the real thing: GHA prefixes every line with a timestamp, the image
+// digest is printed away from the image name, and dependencies appear only as
+// tarball URLs. Verified against two real job logs (11 and 126 deps).
+const JOB_LOG = [
+  "2026-07-31T12:43:40.1Z ##[group]Run docker pull ghcr.io/r-universe-org/build-source:latest",
+  "2026-07-31T12:43:41.2Z latest: Pulling from r-universe-org/build-source",
+  "2026-07-31T12:43:47.3Z Digest: sha256:" + "b9".repeat(32),
+  "2026-07-31T12:43:50.1Z trying URL 'https://p3m.dev/all/__linux__/resolute/latest/src/contrib/abind_1.4-8.tar.gz'",
+  "2026-07-31T12:43:51.2Z trying URL 'https://p3m.dev/all/__linux__/resolute/latest/src/contrib/bit64_4.8.2.tar.gz'",
+  "2026-07-31T12:43:52.3Z trying URL 'https://bioc.r-universe.dev/bin/linux/resolute-x86_64/4.6/src/contrib/msa_1.45.1.tar.gz'",
+  "2026-07-31T12:44:01.9Z * DONE (abind)",
+].join("\n");
+
+test("buildManifest recovers the image and resolved dependency versions", () => {
+  const m = buildManifest(JOB_LOG);
+  assert.equal(m.image, `ghcr.io/r-universe-org/build-source@sha256:${"b9".repeat(32)}`,
+    "pinned by digest, not by the :latest tag it was pulled with");
+  assert.deepEqual(m.deps, { abind: "1.4-8", bit64: "4.8.2", msa: "1.45.1" },
+    "hyphenated and multi-dot versions both parse");
+  assert.deepEqual(m.repos, [
+    "https://bioc.r-universe.dev/bin/linux/resolute-x86_64/4.6",
+    "https://p3m.dev/all/__linux__/resolute/latest",
+  ]);
+
+  // A log with no install section must not claim the build had no dependencies —
+  // captureLogs uses this emptiness to decide not to write a manifest at all.
+  const none = buildManifest("2026-07-31T12:43:40.1Z nothing to see");
+  assert.equal(none.image, undefined);
+  assert.deepEqual(none.deps, {});
+  assert.deepEqual(none.repos, []);
+
+  // An image with no digest line is not a pin, so it is not recorded as one.
+  assert.equal(buildManifest("pulled ghcr.io/r-universe-org/build-source:latest").image, undefined);
+});
+
+test("pendingArtifacts carries the artifact id and skips jobs without one", () => {
+  const pkgs = [
+    { _jobs: [{ job: 30, artifact: "c" }, { job: 10, artifact: "a" }] },
+    { _jobs: [{ job: 20, artifact: "" }, { job: 25, artifact: "b" }, { job: 10, artifact: "a" }] },
+  ];
+  assert.deepEqual(pendingArtifacts(pkgs, 0, 10),
+    [{ job: 10, artifact: "a" }, { job: 25, artifact: "b" }, { job: 30, artifact: "c" }],
+    "sorted, deduped, and job 20 has nothing to fetch");
+  assert.deepEqual(pendingArtifacts(pkgs, 10, 10),
+    [{ job: 25, artifact: "b" }, { job: 30, artifact: "c" }], "cursor is exclusive");
+  assert.deepEqual(pendingArtifacts(pkgs, 0, 1), [{ job: 10, artifact: "a" }], "capped");
 });
 
 test("pendingJobIds walks forward from the cursor, deduped and rate-capped", () => {
