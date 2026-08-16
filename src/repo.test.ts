@@ -233,6 +233,10 @@ const JOB_LOG = [
   "2026-07-31T12:43:50.1Z trying URL 'https://p3m.dev/all/__linux__/resolute/latest/src/contrib/abind_1.4-8.tar.gz'",
   "2026-07-31T12:43:51.2Z trying URL 'https://p3m.dev/all/__linux__/resolute/latest/src/contrib/bit64_4.8.2.tar.gz'",
   "2026-07-31T12:43:52.3Z trying URL 'https://bioc.r-universe.dev/bin/linux/resolute-x86_64/4.6/src/contrib/msa_1.45.1.tar.gz'",
+  // Only Linux installs from source. Windows and macOS pull binaries, and missing
+  // these left 52% of jobs with no dependency versions at all.
+  "2026-07-31T12:43:53.4Z trying URL 'https://cloud.r-project.org/bin/windows/contrib/4.7/utf8_1.2.6.zip'",
+  "2026-07-31T12:43:54.5Z trying URL 'https://cloud.r-project.org/bin/macosx/big-sur-arm64/contrib/4.6/pillar_1.11.1.tgz'",
   "2026-07-31T12:44:01.9Z * DONE (abind)",
 ].join("\n");
 
@@ -240,10 +244,12 @@ test("buildManifest recovers the image and resolved dependency versions", () => 
   const m = buildManifest(JOB_LOG);
   assert.equal(m.image, `ghcr.io/r-universe-org/build-source@sha256:${"b9".repeat(32)}`,
     "pinned by digest, not by the :latest tag it was pulled with");
-  assert.deepEqual(m.deps, { abind: "1.4-8", bit64: "4.8.2", msa: "1.45.1" },
-    "hyphenated and multi-dot versions both parse");
+  assert.deepEqual(m.deps,
+    { abind: "1.4-8", bit64: "4.8.2", msa: "1.45.1", utf8: "1.2.6", pillar: "1.11.1" },
+    "source .tar.gz, Windows .zip and macOS .tgz all parse");
   assert.deepEqual(m.repos, [
-    "https://bioc.r-universe.dev/bin/linux/resolute-x86_64/4.6",
+    "https://bioc.r-universe.dev",
+    "https://cloud.r-project.org",
     "https://p3m.dev/all/__linux__/resolute/latest",
   ]);
 
@@ -256,6 +262,19 @@ test("buildManifest recovers the image and resolved dependency versions", () => 
 
   // An image with no digest line is not a pin, so it is not recorded as one.
   assert.equal(buildManifest("pulled ghcr.io/r-universe-org/build-source:latest").image, undefined);
+
+  // Windows and macOS run on GitHub-hosted runners, not in a container, so there
+  // is no digest. The runner image is the only environment they can be pinned to,
+  // and without this fallback half the jobs would record none at all.
+  const hosted = [
+    "2026-07-31T12:43:40.1Z ##[group]Runner Image",
+    "2026-07-31T12:43:40.2Z Image: windows-2025-vs2026",
+    "2026-07-31T12:43:40.3Z Version: 20260628.158.1",
+    "2026-07-31T12:43:41.1Z trying URL 'https://cloud.r-project.org/bin/windows/contrib/4.7/utf8_1.2.6.zip'",
+  ].join("\n");
+  const h = buildManifest(hosted);
+  assert.equal(h.image, "windows-2025-vs2026@20260628.158.1");
+  assert.deepEqual(h.deps, { utf8: "1.2.6" });
 });
 
 test("pendingArtifacts carries the artifact id and skips jobs without one", () => {
