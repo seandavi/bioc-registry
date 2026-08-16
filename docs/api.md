@@ -38,7 +38,11 @@ Plain-text GHA job log (`job` ids come from `_jobs[].job`), served from
 `logs/{universe}/{job}.txt` in the bucket — not proxied, so no token sits on a
 public route and the log stays readable after GitHub deletes it at ~90 days.
 
-Capture runs on the cron (`captureLogs`), 50 jobs per run, walking forward from
+This is the *runner's* log: docker pulls, dependency installs, compiler output.
+It does not contain R CMD check's verdict — for that see
+[`/checks/{universe}/{job}`](#get-checksuniversejob).
+
+Capture runs on the cron (`captureLogs`), 200 jobs per run, walking forward from
 a high-water mark in `state/{universe}/logcursor`. It only captures jobs seen
 after it was switched on; anything older 404s here with a link to GHA. Capture
 no-ops entirely without the `GITHUB_TOKEN` worker secret — GitHub returns 403
@@ -77,6 +81,76 @@ tick or two. It stays frozen when the token is missing (capture returns early)
 and also when the cron invocation dies before the cursor is written — capture is
 wrapped in a `.catch` so nothing surfaces either way. A frozen cursor with the
 secret present means the invocation is failing, not the token.
+
+### `GET /checks/{universe}/{job}`
+
+R CMD check's own output for one job, as a JSON object keyed by file basename.
+This is a different corpus from `/logs`: the GitHub Actions *job* log that route
+serves is the runner's output — docker pulls, dependency installs, compiler noise
+— and does not contain the check verdict at all. That lives in the artifact the
+job uploads, along with everything else worth reading:
+
+| file | what |
+|---|---|
+| `00check.log` | the check verdict and every failing section |
+| `00install.out` | that platform's build log |
+| `{pkg}-Ex.Rout` | the example transcript (`.fail` when examples errored) |
+| `testthat.Rout` / `runTests.Rout` | the test transcript (`.Rout.fail` when tests errored) |
+| `00BiocCheck.log`, `output.log` | BiocCheck's report, on the `bioc-checks` config |
+| `build.log` | wasm builds |
+
+```bash
+B=https://bioc-registry.seandavi.workers.dev
+curl -s $B/checks/bioc/91651624895 | jq -r '."00check.log"' | grep -A20 'ERROR'
+```
+
+Capture runs on the cron (`captureChecks`), 100 jobs per run, walking forward from
+`state/{universe}/checkcursor` exactly as log capture does. It needs the same
+`GITHUB_TOKEN` secret and no-ops without it.
+
+An artifact is a zip holding up to 7.6MB of built package around ~65KB of that
+text, so it is never downloaded whole: the length comes from a `HEAD`, the zip's
+central directory from one range request against the end of the file, and then one
+range per text entry. The blob host GitHub redirects to honours ranges but **not**
+the suffix form — `Range: bytes=-65536` returns `200` with the entire file — which
+is why the length is looked up first rather than assumed.
+
+Artifacts expire upstream at ~100 days (`_expires` on the observation record is the
+deadline), so a job missed by capture is 404 here permanently. Everything captured
+is kept; at ~65KB per job and ~1.5k new jobs a day, the whole corpus grows about
+30GB a year, which is not worth an expiry policy.
+
+### `GET /builds/{universe}/{job}`
+
+What the build actually ran with, extracted from the job log at capture time:
+
+```json
+{
+  "image": "ghcr.io/r-universe-org/build-source@sha256:b9a53fe82cfe…",
+  "repos": ["https://bioc.r-universe.dev/bin/linux/resolute-x86_64/4.6",
+            "https://p3m.dev/all/__linux__/resolute/latest"],
+  "deps": { "abind": "1.4-8", "bit64": "4.8.2", "msa": "1.45.1" }
+}
+```
+
+This is the piece that makes a failure reproducible rather than merely visible. A
+check that broke without the package changing broke because a dependency moved,
+and nothing else records which versions were installed — r-universe's `_rundeps`
+is names without versions, and the check artifact has only the R revision and the
+OS. The versions are recoverable from the raw job log, but that runs to 9MB, so
+they are parsed once here instead of by every consumer.
+
+The repo URLs are worth reading alongside: p3m's `.../latest` is a moving
+snapshot, so it pins nothing, and `deps` is the only record of what "latest" meant
+that day.
+
+`image` is pinned by digest rather than by the `:latest` tag it was pulled with,
+so it can actually be re-run. Bioconductor's build system describes its builders
+with `NodeInfo.html` and lists installed versions in `R-instpkgs.html` — but only
+for the current run: the latter 404s as soon as a release is archived.
+
+Derived from the job log, so it exists exactly where [`/logs`](#get-logsuniversejob)
+does, and is written by the same cron pass.
 
 ### `GET /docs` and `GET /openapi.json`
 
@@ -123,7 +197,7 @@ Serves any object in the bucket by key (see [Storage keys](#storage-keys)).
 
 - Supports `Range` requests (returns `206` + `Content-Range`) and `HEAD` —
   this is what makes remote DuckDB/`httpfs` work against the parquet files.
-- Write-once objects (`obs/`, `parquet/`, `logs/`, `prop/*/cas/`, `prop/*/log/`,
+- Write-once objects (`obs/`, `parquet/`, `logs/`, `checks/`, `builds/`, `prop/*/cas/`, `prop/*/log/`,
   `prop/*/pending/`) are served `immutable`. Everything rewritten in place —
   the `state/` pointers, `prop/{universe}/index.json`, the seed files — is
   served `no-store`, so a reader never gets a stale index.
@@ -245,7 +319,7 @@ All addressable through `/data/<key>`.
 
 | key pattern | content |
 |---|---|
-| `obs/{universe}/dt=YYYY-MM-DD/{ts}-{digest12}.json` | full observation: array of package records (`Package`, `Version`, `_sha256`, `_status`, `_jobs`, `_binaries`, `_created`, `_expires`, `_fileid`, `_commit`, `_failure`) |
+| `obs/{universe}/dt=YYYY-MM-DD/{ts}-{digest12}.json` | full observation: array of package records (`Package`, `Version`, `_sha256`, `_status`, `_jobs`, `_binaries`, `_created`, `_expires`, `_fileid`, `_commit`, `_failure`, and the reproduction fields below) |
 | `state/{universe}/latest` | `{digest, key, ts}` of the newest observation |
 | `parquet/jobs/universe={u}/dt=…/{ts}-{digest12}.parquet` | jobs table for that observation (schema below) |
 | `parquet/jobs/universe={u}/dt=…/{ts}-m.parquet` | same schema, holding several observations of a closed day merged together |
@@ -253,6 +327,9 @@ All addressable through `/data/<key>`.
 | `state/{universe}/rowstate` | `{ts, rows}` — value hash per `(package, config)`, the baseline the next observation is diffed against |
 | `state/{universe}/observations.json` | every observation timestamp, including ones that changed nothing |
 | `logs/{universe}/{job}.txt` | captured GHA job log |
+| `checks/{universe}/{job}.json` | captured check logs for that job, keyed by file basename |
+| `builds/{universe}/{job}.json` | `{image, repos[], deps{}}` parsed from that job's log |
+| `state/{universe}/checkcursor` | `{job}` high-water mark for check-log capture |
 | `prop/{universe}/index.json` | `{ [package]: {version, sha256, ts, bioccheck, artifacts[], desc, meta, archs} }` — the propagated set |
 | `prop/{universe}/cas/{sha256}` | artifact bytes (source tarball or platform binary), keyed by content hash |
 | `prop/{universe}/pending/{digest12}.json` | gate output for one observation: array of candidates |
@@ -262,6 +339,31 @@ All addressable through `/data/<key>`.
 
 `{universe}` is `bioc` (devel) or `bioc-release`. `{digest12}` is the first 12
 hex chars of the observation body's sha256.
+
+### Reproduction fields on an observation record
+
+Beyond the build state, each record carries what it would take to re-run the
+build. Together with `/builds` (image digest and dependency versions) and
+`/checks` (R revision, platform, check flags), this is the full set.
+
+| field | on | what |
+|---|---|---|
+| `_sysdeps` | 393/2419 | system libraries **with versions** — `libtbb12` 2022.3.0-2, `libstdc++6` 16-20260322-1ubuntu1 |
+| `_distro` | all | the builder's Ubuntu codename, e.g. `resolute` |
+| `RemoteUrl`, `RemoteRef`, `RemoteSha` | 2398 | the exact source pin; `RemoteSha` is the full 40 chars, where `_commit.id` is abbreviated |
+| `_upstream` | all | the `github.com/bioc/*` mirror the build read |
+| `_devurl` | 1432 | the **maintainer's own development repository** — unlike `git_url`, somewhere a fix can actually be sent |
+| `_bioccheck` | 2316 | BiocCheck counts, `{error, warning, note}` — the index's own `bioccheck` is only the job's verdict |
+| `_bioc` | 2393 | this package's version on each branch, e.g. devel 4.11.4 / release 4.10.1 |
+| `_filesize`, `_cranurl` | 2398 | source tarball size; whether the package is also on CRAN |
+| `Config/Bioconductor/UnsupportedPlatforms` | 42 | why a platform is legitimately missing |
+
+Adding these grew an observation from 25.9MB to 27.7MB (+7%).
+
+Deliberately excluded: `_downloads` and `_score` change continuously, so they
+would make every poll produce a fresh digest — ~16 observations a day becomes 96,
+each a full 27MB. `_help` (29MB) and `_exports` (5.8MB) would more than double the
+observation to archive what a consumer can ask r-universe for directly.
 
 ### Rows are stored as changes, not snapshots
 
@@ -285,8 +387,10 @@ appear to persist in `jobs`. And those files have no `deleted` column, so reader
 must normalise one in — `union_by_name=true` only unions columns that at least
 one file actually has.
 
-The cron compacts closed days in the background, merging up to 6 parquet files
-per run into one `-m.parquet`. Consumers should read whatever `/manifest.json`
+The cron compacts closed days in the background, merging as many of a day's
+parquet files per run as fit in a ~3MB budget into one `-m.parquet`. A day whose
+files exceed that budget ends up with more than one `-m.parquet`, which reads
+exactly the same. Consumers should read whatever `/manifest.json`
 currently lists rather than deriving parquet keys from observation keys — a
 given observation's rows may have moved into a merged file. Nothing is lost;
 `obs_ts` still identifies the observation each row came from.
