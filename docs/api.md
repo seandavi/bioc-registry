@@ -152,6 +152,12 @@ for the current run: the latter 404s as soon as a release is archived.
 Derived from the job log, so it exists exactly where [`/logs`](#get-logsuniversejob)
 does, and is written by the same cron pass.
 
+Log capture only walks forward, so the ~52,000 logs captured before manifests
+existed would otherwise never get one. A separate cron pass drains them from the
+bucket at 25 a run, tracked in `state/{universe}/manifestbackfill`; when the key
+listing comes back untruncated it records `{done:true}` and every later run
+no-ops. Nothing needs to be invoked to start or stop it.
+
 ### `GET /docs` and `GET /openapi.json`
 
 Browsable API reference with a try-it panel for every route, rendered by Scalar
@@ -330,6 +336,7 @@ All addressable through `/data/<key>`.
 | `checks/{universe}/{job}.json` | captured check logs for that job, keyed by file basename |
 | `builds/{universe}/{job}.json` | `{image, repos[], deps{}}` parsed from that job's log |
 | `state/{universe}/checkcursor` | `{job}` high-water mark for check-log capture |
+| `state/{universe}/manifestbackfill` | `{cursor}` into the `logs/` listing, or `{done:true}` — the one-time walk that gives already-captured logs a manifest |
 | `prop/{universe}/index.json` | `{ [package]: {version, sha256, ts, bioccheck, artifacts[], desc, meta, archs} }` — the propagated set |
 | `prop/{universe}/cas/{sha256}` | artifact bytes (source tarball or platform binary), keyed by content hash |
 | `prop/{universe}/pending/{digest12}.json` | gate output for one observation: array of candidates |
