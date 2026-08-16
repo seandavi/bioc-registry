@@ -144,8 +144,15 @@ The repo URLs are worth reading alongside: p3m's `.../latest` is a moving
 snapshot, so it pins nothing, and `deps` is the only record of what "latest" meant
 that day.
 
+`deps` covers all three install layouts, because only Linux installs from source:
+Windows and macOS pull binaries from `bin/{windows,macosx}/…/contrib/{r}/` as
+`.zip` and `.tgz`.
+
 `image` is pinned by digest rather than by the `:latest` tag it was pulled with,
-so it can actually be re-run. Bioconductor's build system describes its builders
+so it can actually be re-run — `ghcr.io/r-universe-org/base-image@sha256:…` for
+the containerised configs. Windows and macOS jobs run on GitHub-hosted runners
+instead, where there is no digest, so they record the runner image GitHub
+publishes: `windows-2025-vs2026@20260628.158.1`, `macos-15-arm64@20260630.0202.1`. Bioconductor's build system describes its builders
 with `NodeInfo.html` and lists installed versions in `R-instpkgs.html` — but only
 for the current run: the latter 404s as soon as a release is archived.
 

@@ -617,23 +617,32 @@ export function buildManifest(log: string): BuildManifest {
   // "Digest:" line docker prints does not repeat the name next to it.
   const image = /((?:ghcr|docker)\.io\/[a-z0-9._\-/]+):[a-z0-9._-]+/i.exec(log)?.[1];
   const digest = /Digest: (sha256:[a-f0-9]{64})/.exec(log)?.[1];
+  // Windows and macOS jobs run on GitHub-hosted runners rather than in a
+  // container, so there is no digest to pin. The runner image name and version
+  // are the closest equivalent GitHub publishes, and without this half the jobs
+  // would record no environment at all.
+  const runner = /\bImage: (\S+)[\s\S]{0,400}?\bVersion: (\S+)/.exec(log);
   const deps: Record<string, string> = {};
   const repos = new Set<string>();
-  // Dependencies arrive as plain tarball downloads, so each URL carries both the
+  // Dependencies arrive as plain package downloads, so each URL carries both the
   // resolved version and the repo it resolved from. The repo matters on its own:
   // p3m's ".../latest" is a moving snapshot, so it pins nothing and the versions
   // here are the only record of what "latest" meant that day.
+  //
+  // All three layouts, because only Linux installs from source. Windows and macOS
+  // pull binaries out of bin/{windows,macosx}/…/contrib/{r}/ as .zip and .tgz, and
+  // matching src/contrib alone missed 52% of jobs — the half where a
+  // platform-specific failure most needs to know what it was built against.
   for (const m of log.matchAll(
-    /(https?:\/\/[\w.\-/]+?)\/src\/contrib\/([A-Za-z][\w.]*)_([0-9][\w.\-]*)\.tar\.gz/g
+    // The optional directory after contrib/ is the R minor, which only the binary
+    // layouts carry: src/contrib/pkg.tar.gz but bin/windows/contrib/4.7/pkg.zip.
+    /(https?:\/\/[\w.\-/]+?)\/(?:src|bin)\/[\w.\-/]*?contrib\/(?:[\w.]+\/)?([A-Za-z][\w.]*)_([0-9][\w.\-]*)\.(?:tar\.gz|tgz|zip)/g
   )) {
     repos.add(m[1]);
     deps[m[2]] = m[3];
   }
-  return {
-    ...(image && digest ? { image: `${image}@${digest}` } : {}),
-    repos: [...repos].sort(),
-    deps,
-  };
+  const pin = image && digest ? `${image}@${digest}` : runner ? `${runner[1]}@${runner[2]}` : undefined;
+  return { ...(pin ? { image: pin } : {}), repos: [...repos].sort(), deps };
 }
 
 // ---------- zip central directory ----------
