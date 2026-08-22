@@ -40,8 +40,11 @@ jobs:
         # Non-blocking: a random pick can fail for upstream reasons (missing
         # system libs, deps not yet propagated) that are diagnosis input for
         # #7, not a registry outage. Flip to blocking when that noise is gone.
+        # Green means "ran", not "clean" -- the result lands in the step
+        # summary either way.
         continue-on-error: true
         run: |
+          set -o pipefail
           Rscript -e '
             install.packages("jsonlite")
             idx <- jsonlite::fromJSON(sprintf(
@@ -53,4 +56,15 @@ jobs:
             repos <- c(BIOC = Sys.getenv("REPO_URL"), getOption("repos"))
             install.packages(picks, repos = repos)
             invisible(lapply(picks, loadNamespace))
-          '
+            cat("sample-result: all", length(picks), "loaded\n")
+          ' 2>&1 | tee sample.log
+
+      - name: Sample result into the run summary
+        if: always()
+        run: |
+          [ -f sample.log ] || exit 0
+          { echo "## Random-sample install: ${{ matrix.universe }} (non-blocking)"
+            echo '```'
+            grep -E '^sampled:|^sample-result:|^Error|non-zero exit' sample.log || tail -3 sample.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
