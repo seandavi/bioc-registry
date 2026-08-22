@@ -1,0 +1,56 @@
+# Daily installation canary: freshness.yml proves the registry *serves*;
+# this proves what it serves actually *installs* into a real R session.
+# The badge is the status light: red means the repo surface is broken for
+# the pinned canaries. (#27)
+name: install
+
+on:
+  schedule:
+    - cron: "27 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        universe: [bioc, bioc-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REPO_URL: https://bioc-registry.seandavi.workers.dev/repo/${{ matrix.universe }}
+    steps:
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install pinned canaries (edgeR, limma)
+        # Popular, modest dependency trees, present in both universes.
+        # Installed from source from the registry, CRAN deps as binaries;
+        # loadNamespace() proves the result is usable, not just unpacked.
+        run: |
+          Rscript -e '
+            repos <- c(BIOC = Sys.getenv("REPO_URL"), getOption("repos"))
+            install.packages(c("edgeR", "limma"), repos = repos)
+            invisible(lapply(c("edgeR", "limma"), loadNamespace))
+          '
+
+      - name: Install a random sample from the propagation index
+        # Date-seeded so a failure reproduces on re-run the same day.
+        # Non-blocking: a random pick can fail for upstream reasons (missing
+        # system libs, deps not yet propagated) that are diagnosis input for
+        # #7, not a registry outage. Flip to blocking when that noise is gone.
+        continue-on-error: true
+        run: |
+          Rscript -e '
+            install.packages("jsonlite")
+            idx <- jsonlite::fromJSON(sprintf(
+              "https://bioc-registry.seandavi.workers.dev/data/prop/%s/index.json",
+              "${{ matrix.universe }}"))
+            set.seed(as.integer(Sys.Date()))
+            picks <- sample(names(idx), 3)
+            cat("sampled:", picks, "\n")
+            repos <- c(BIOC = Sys.getenv("REPO_URL"), getOption("repos"))
+            install.packages(picks, repos = repos)
+            invisible(lapply(picks, loadNamespace))
+          '
