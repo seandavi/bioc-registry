@@ -63,7 +63,14 @@ jobs:
             candidates <- setdiff(intersect(names(idx), rownames(db)), sysdep_hogs)
             closure <- tools::package_dependencies(candidates, db,
               which = c("Depends", "Imports", "LinkingTo"), recursive = TRUE)
-            eligible <- names(Filter(function(d) !any(d %in% sysdep_hogs), closure))
+            # Besides the hogs, every dep must actually be resolvable from
+            # registry+CRAN: annotation/experiment data packages have no build
+            # home yet (the M2 workstream), so e.g. crisprScore -> crisprScoreData
+            # cannot install here no matter what the registry does.
+            base_pkgs <- rownames(installed.packages(priority = c("base", "recommended")))
+            known <- c(rownames(db), base_pkgs, "R")
+            eligible <- names(Filter(function(d)
+              !any(d %in% sysdep_hogs) && all(d %in% known), closure))
             cat("eligible:", length(eligible), "of", length(names(idx)), "\n")
             set.seed(as.integer(Sys.Date()))
             picks <- sample(eligible, min(3, length(eligible)))
