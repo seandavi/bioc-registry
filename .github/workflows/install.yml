@@ -42,9 +42,9 @@ jobs:
         # run failed only on the runner image (curl/curl.h for Rhtslib, HDF5
         # cmake for Rhdf5lib, libglpk.so.40 for igraph), which tests Ubuntu,
         # not the registry. With those out, a failure here means the install
-        # path itself is broken. Non-blocking until it has been quiet a few
-        # days; findings land in the step summary either way.
-        continue-on-error: true
+        # path itself is broken, so it fails the run: a false positive costs
+        # a red badge, a miss costs users a broken install. Findings land in
+        # the step summary either way.
         run: |
           set -o pipefail
           Rscript -e '
@@ -84,7 +84,7 @@ jobs:
         if: always()
         run: |
           [ -f sample.log ] || exit 0
-          { echo "## Random-sample install: ${{ matrix.universe }} (non-blocking)"
+          { echo "## Random-sample install: ${{ matrix.universe }}"
             echo '```'
             grep -E '^eligible:|^sampled:|^sample-result:|^Error|non-zero exit' sample.log || tail -3 sample.log
             echo '```'
