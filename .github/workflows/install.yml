@@ -37,11 +37,13 @@ jobs:
 
       - name: Install a random sample from the propagation index
         # Date-seeded so a failure reproduces on re-run the same day.
-        # Non-blocking: a random pick can fail for upstream reasons (missing
-        # system libs, deps not yet propagated) that are diagnosis input for
-        # #7, not a registry outage. Flip to blocking when that noise is gone.
-        # Green means "ran", not "clean" -- the result lands in the step
-        # summary either way.
+        # Sampling is restricted to packages whose recursive dependency
+        # closure avoids known system-library hogs: the first unrestricted
+        # run failed only on the runner image (curl/curl.h for Rhtslib, HDF5
+        # cmake for Rhdf5lib, libglpk.so.40 for igraph), which tests Ubuntu,
+        # not the registry. With those out, a failure here means the install
+        # path itself is broken. Non-blocking until it has been quiet a few
+        # days; findings land in the step summary either way.
         continue-on-error: true
         run: |
           set -o pipefail
@@ -50,10 +52,22 @@ jobs:
             idx <- jsonlite::fromJSON(sprintf(
               "https://bioc-registry.seandavi.workers.dev/data/prop/%s/index.json",
               "${{ matrix.universe }}"))
-            set.seed(as.integer(Sys.Date()))
-            picks <- sample(names(idx), 3)
-            cat("sampled:", picks, "\n")
             repos <- c(BIOC = Sys.getenv("REPO_URL"), getOption("repos"))
+            db <- available.packages(repos = repos)
+            # ponytail: denylist grown empirically -- add the offender when a
+            # run fails on a missing system library, nothing fancier.
+            sysdep_hogs <- c("Rhtslib", "Rhdf5lib", "rhdf5", "rhdf5filters",
+                             "igraph", "Rglpk", "glpkAPI", "rgl", "magick",
+                             "sf", "terra", "units", "rjags", "Rmpfr",
+                             "gsl", "RcppGSL", "RCurl", "XML")
+            candidates <- setdiff(intersect(names(idx), rownames(db)), sysdep_hogs)
+            closure <- tools::package_dependencies(candidates, db,
+              which = c("Depends", "Imports", "LinkingTo"), recursive = TRUE)
+            eligible <- names(Filter(function(d) !any(d %in% sysdep_hogs), closure))
+            cat("eligible:", length(eligible), "of", length(names(idx)), "\n")
+            set.seed(as.integer(Sys.Date()))
+            picks <- sample(eligible, min(3, length(eligible)))
+            cat("sampled:", picks, "\n")
             install.packages(picks, repos = repos)
             invisible(lapply(picks, loadNamespace))
             cat("sample-result: all", length(picks), "loaded\n")
@@ -65,6 +79,6 @@ jobs:
           [ -f sample.log ] || exit 0
           { echo "## Random-sample install: ${{ matrix.universe }} (non-blocking)"
             echo '```'
-            grep -E '^sampled:|^sample-result:|^Error|non-zero exit' sample.log || tail -3 sample.log
+            grep -E '^eligible:|^sampled:|^sample-result:|^Error|non-zero exit' sample.log || tail -3 sample.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
