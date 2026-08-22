@@ -1,0 +1,32 @@
+name: freshness
+# Daily probe of the live registry: is the worker up, and has the observer
+# actually observed something recently? The 15-minute poll previously had no
+# alerting at all — a silent stop was detected by someone remembering to look.
+# The badge on this workflow is the status light: red means down or stale.
+on:
+  schedule:
+    - cron: "43 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dashboard responds
+        run: curl -fsS -o /dev/null https://bioc-registry.seandavi.workers.dev/
+
+      - name: Propagation index is served
+        run: |
+          curl -fsS https://bioc-registry.seandavi.workers.dev/data/prop/bioc/index.json \
+            | jq -e 'length > 0' > /dev/null
+
+      - name: Latest observation is under 36 hours old
+        # ponytail: 36 h — new state only lands when upstream changes, so a very
+        # quiet day could false-alarm at 24 h; widen or narrow from experience.
+        run: |
+          for u in bioc bioc-release; do
+            ts=$(curl -fsS "https://bioc-registry.seandavi.workers.dev/data/state/$u/latest" | jq -r .ts)
+            age=$(( $(date +%s) - $(date -d "$ts" +%s) ))
+            echo "$u: last observation $ts (${age}s ago)"
+            test "$age" -lt 129600
+          done

@@ -1,5 +1,7 @@
 # bioc-registry
 
+[![test](https://github.com/seandavi/bioc-registry/actions/workflows/test.yml/badge.svg)](https://github.com/seandavi/bioc-registry/actions/workflows/test.yml)
+[![freshness](https://github.com/seandavi/bioc-registry/actions/workflows/freshness.yml/badge.svg)](https://github.com/seandavi/bioc-registry/actions/workflows/freshness.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![API docs](https://img.shields.io/badge/API-docs-informational)](https://bioc-registry.seandavi.workers.dev/docs)
 [![Code of Conduct](https://img.shields.io/badge/Code%20of%20Conduct-Bioconductor-brightgreen)](CODE_OF_CONDUCT.md)
