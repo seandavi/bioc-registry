@@ -3,7 +3,7 @@ import { parquetWriteBuffer } from "hyparquet-writer";
 import { parquetReadObjects } from "hyparquet";
 import {
   Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
-  describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
+  approveByDeps, describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
   parseGitmodules, parseRepoDir, passingFamilies, pendingArtifacts, pendingJobIds,
   planCompaction, parseZipCentral, isLogEntry, buildManifest,
   invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
@@ -573,9 +573,22 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
       archs,
     });
   }
+  // Build gate passed; now the dependency gate (#34). Blocked candidates are
+  // simply not written to pending — their version is still ahead of what is
+  // published, so they are reconsidered on every later wave and land as soon as
+  // whatever they are waiting on propagates.
+  const { approved, blocked } = approveByDeps(candidates, idx);
   const pendingKey = `prop/${universe}/pending/${digest.slice(0, 12)}.json`;
-  await env.ARCHIVE.put(pendingKey, JSON.stringify(candidates));
-  return { pendingKey, count: candidates.length };
+  await env.ARCHIVE.put(pendingKey, JSON.stringify(approved));
+  // Written next to pending so "why has X not propagated?" is answerable from
+  // the archive rather than by re-deriving it. Only when non-empty: the steady
+  // state is nothing blocked, and an empty file every wave is just noise.
+  if (blocked.length)
+    await env.ARCHIVE.put(
+      `prop/${universe}/blocked/${digest.slice(0, 12)}.json`,
+      JSON.stringify(blocked)
+    );
+  return { pendingKey, count: approved.length, blocked: blocked.length };
 }
 
 async function copyCas(env: Env, universe: string, sha256: string): Promise<boolean> {

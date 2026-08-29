@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildManifest, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
+import { approveByDeps, buildManifest, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -652,6 +652,7 @@ test("writeOnce: only immutable objects may be cached", () => {
     "prop/bioc/cas/abc123",
     "prop/bioc/log/2026-08-14T00:00:00Z-edgeR_4.10.1.json",
     "prop/bioc/pending/abc123.json",
+    "prop/bioc/blocked/abc123.json",
   ]) assert.ok(writeOnce(k), k);
 
   // These are rewritten in place; caching them serves a stale index.
@@ -668,4 +669,80 @@ test("described: the one rule that decides whether R can see an entry", () => {
   assert.ok(described({ desc: { License: "MIT" } }));
   assert.ok(!described({}), "no desc at all");
   assert.ok(!described({ desc: {} }), "empty desc means the data was never captured");
+});
+
+// ---------- propagation dependency gate (#34) ----------
+
+test("depConstraints: hard roles only, R and base packages dropped", () => {
+  assert.deepEqual(
+    depConstraints({
+      Depends: "R (>= 4.0.0), methods, BiocGenerics (>= 0.59.5), S4Vectors (>= 0.51.8)",
+      Imports: "stats, utils, Rcpp",
+      LinkingTo: "Rcpp (>= 1.0.0)",
+      Suggests: "testthat (>= 3.0.0)",
+    }),
+    [
+      { pkg: "BiocGenerics", op: ">=", ver: "0.59.5" },
+      { pkg: "S4Vectors", op: ">=", ver: "0.51.8" },
+      { pkg: "Rcpp", op: "", ver: "" },
+      { pkg: "Rcpp", op: ">=", ver: "1.0.0" },
+    ]
+  );
+  // No whitespace around the operator, and a bare > constraint.
+  assert.deepEqual(depConstraints({ Imports: "IRanges(>2.47.2)" }),
+    [{ pkg: "IRanges", op: ">", ver: "2.47.2" }]);
+  assert.deepEqual(depConstraints({}), []);
+});
+
+// The incident this gate exists for: IRanges 2.47.3 requires S4Vectors >= 0.51.8,
+// S4Vectors 0.51.8 failed its own checks so it is not a candidate, and the index
+// still publishes 0.51.7. Propagating IRanges would serve a pair that exists
+// nowhere and cannot install.
+test("approveByDeps: blocks a candidate whose published dependency is too old", () => {
+  const idx = { S4Vectors: { version: "0.51.7" } } as never;
+  const iranges = {
+    package: "IRanges", version: "2.47.3",
+    desc: { Depends: "S4Vectors (>= 0.51.8)" },
+  };
+  const { approved, blocked } = approveByDeps([iranges], idx);
+  assert.deepEqual(approved, []);
+  assert.deepEqual(blocked, [{
+    package: "IRanges", version: "2.47.3",
+    needs: "S4Vectors (>= 0.51.8), published 0.51.7",
+  }], "a stuck package must say what it is stuck on");
+});
+
+test("approveByDeps: coordinated bump lands, dependency ordered first", () => {
+  const idx = { S4Vectors: { version: "0.51.7" }, IRanges: { version: "2.47.2" } } as never;
+  // Deliberately listed dependent-first to prove the ordering is computed.
+  const { approved } = approveByDeps([
+    { package: "IRanges", version: "2.47.3", desc: { Depends: "S4Vectors (>= 0.51.8)" } },
+    { package: "S4Vectors", version: "0.51.8", desc: { Imports: "stats" } },
+  ], idx);
+  assert.deepEqual(approved.map((c) => c.package), ["S4Vectors", "IRanges"],
+    "a dependency must never be published after the package needing it");
+});
+
+test("approveByDeps: dependencies we do not publish are not our business", () => {
+  const idx = { S4Vectors: { version: "0.51.9" } } as never;
+  const { approved } = approveByDeps([{
+    package: "edgeR", version: "4.10.1",
+    // Rcpp is CRAN's, crisprScoreData has no build home until M2; neither is
+    // ours to vouch for, so neither may block.
+    desc: { Depends: "S4Vectors (>= 0.51.8)", Imports: "Rcpp (>= 99.0.0), crisprScoreData" },
+  }], idx);
+  assert.deepEqual(approved.map((c) => c.package), ["edgeR"]);
+});
+
+test("approveByDeps: a mutual dependency cycle cannot deadlock the whole wave", () => {
+  const idx = { A: { version: "1.0.0" }, B: { version: "1.0.0" }, C: { version: "1.0.0" } } as never;
+  const { approved, blocked } = approveByDeps([
+    { package: "A", version: "2.0.0", desc: { Imports: "B (>= 2.0.0)" } },
+    { package: "B", version: "2.0.0", desc: { Imports: "A (>= 2.0.0)" } },
+    { package: "C", version: "2.0.0", desc: { Imports: "stats" } },
+  ], idx);
+  // A and B each need the other's new version before either is published, so
+  // neither can go first and both wait. C is unaffected.
+  assert.deepEqual(approved.map((c) => c.package), ["C"]);
+  assert.deepEqual(blocked.map((b) => b.package), ["A", "B"]);
 });

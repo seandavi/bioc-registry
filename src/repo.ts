@@ -49,7 +49,7 @@ export function metaOf(p: Partial<Record<(typeof META_FIELDS)[number], string>> 
 // pointers, prop/*/index.json, the seed plan — is rewritten in place, and
 // serving those with a long immutable cache hands out a stale index.
 export const writeOnce = (key: string) =>
-  /^(obs|parquet|logs|checks|builds)\/|\/(cas|log|pending)\//.test(key);
+  /^(obs|parquet|logs|checks|builds)\/|\/(cas|log|pending|blocked)\//.test(key);
 
 // Fresh metadata from an observation replaces what was stored, so a field the
 // package dropped upstream disappears here too. git_url is the exception: it
@@ -389,6 +389,104 @@ export function verGt(a: string, b: string): boolean {
     if (d) return d > 0;
   }
   return false;
+}
+
+// ---------- propagation dependency gate (#34) ----------
+// Roles R must resolve to install a package. Suggests/Enhances are excluded:
+// they are not needed to install, and BBS's propagation check ignores them too.
+const HARD_ROLES = ["Depends", "Imports", "LinkingTo"] as const;
+
+// Base packages ship with R itself, so depending on one is always satisfiable
+// and their versions track R's, not ours. Recommended packages are deliberately
+// NOT here — they come from CRAN, which lands in the "not ours" branch below.
+const BASE_PKGS = new Set([
+  "base", "compiler", "datasets", "graphics", "grDevices", "grid", "methods",
+  "parallel", "splines", "stats", "stats4", "tcltk", "tools", "utils",
+]);
+
+export type DepReq = { pkg: string; op: string; ver: string };
+
+// Parse the hard dependency fields into (package, constraint) triples. Only >=
+// and > are enforced; R permits others but they are vanishingly rare and BBS
+// ignores them as well, so anything we cannot parse reads as "no constraint"
+// rather than as a blocker.
+export function depConstraints(d: Desc): DepReq[] {
+  const out: DepReq[] = [];
+  for (const role of HARD_ROLES)
+    for (const entry of (d[role] ?? "").split(",")) {
+      const m = entry.trim().match(
+        /^([A-Za-z][A-Za-z0-9._]*)\s*(?:\(\s*(>=?)\s*([0-9][0-9.-]*)\s*\))?/
+      );
+      if (!m || m[1] === "R" || BASE_PKGS.has(m[1])) continue;
+      out.push({ pkg: m[1], op: m[2] ?? "", ver: m[3] ?? "" });
+    }
+  return out;
+}
+
+// A candidate may propagate only if every hard dependency WE publish is present
+// at a version its constraint accepts. Dependencies we do not publish — CRAN,
+// and the annotation/experiment data packages that have no build home until M2 —
+// pass untouched: we cannot vouch for them either way, and blocking on them
+// would strand well over half the universe (the canary measures ~1050 of 2391
+// with a fully resolvable closure). This is Hervé's "no propagations that
+// introduce impossible dependencies" narrowed to impossibilities we can see.
+//
+// Approval is a fixpoint, as in BBS's makePropagationStatusDb.R: a candidate
+// blocked only by another candidate in the same wave is approved once that one
+// is, so a coordinated bump (S4Vectors + IRanges together) still lands. Checking
+// direct dependencies is enough to make the whole index consistent, because the
+// gate holds inductively for everything already in it.
+//
+// The returned order is that fixpoint order, which is a topological sort: a
+// dependency is never published after the package that needs it. propagateBatch()
+// writes the index in slices, so without this the index could serve the broken
+// pair transiently even when both were approved together.
+// Blocked candidates come back with the unmet requirement spelled out, the way
+// BBS records an "explain" for every package: without it a package that quietly
+// stops propagating is undiagnosable after the fact.
+export type Blocked = { package: string; version: string; needs: string };
+
+export function approveByDeps<T extends { package: string; version: string; desc: Desc }>(
+  candidates: T[], idx: PropIndex
+): { approved: T[]; blocked: Blocked[] } {
+  const published = new Map<string, string>(
+    Object.entries(idx).map(([name, e]) => [name, e.version])
+  );
+  // The first requirement this candidate cannot meet, or null if it is clear.
+  const unmet = (d: Desc): DepReq | null => {
+    for (const r of depConstraints(d)) {
+      const have = published.get(r.pkg);
+      if (have === undefined) continue;
+      if (r.op === ">=" && verGt(r.ver, have)) return r;
+      if (r.op === ">" && !verGt(have, r.ver)) return r;
+    }
+    return null;
+  };
+  const approved: T[] = [];
+  let pool = candidates;
+  let reasons = new Map<string, DepReq>();
+  while (pool.length) {
+    const pass: T[] = [], held: T[] = [];
+    reasons = new Map();
+    for (const c of pool) {
+      const r = unmet(c.desc);
+      if (r) { reasons.set(c.package, r); held.push(c); } else pass.push(c);
+    }
+    if (!pass.length) break; // nothing left that this wave can unblock
+    for (const c of pass) published.set(c.package, c.version);
+    approved.push(...pass);
+    pool = held;
+  }
+  return {
+    approved,
+    blocked: pool.map((c) => {
+      const r = reasons.get(c.package)!;
+      return {
+        package: c.package, version: c.version,
+        needs: `${r.pkg} (${r.op} ${r.ver}), published ${published.get(r.pkg)}`,
+      };
+    }),
+  };
 }
 
 // CRAN renamed the macOS arm64 directory at R 4.6 (big-sur-arm64 -> sonoma-arm64)
