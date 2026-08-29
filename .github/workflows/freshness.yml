@@ -30,3 +30,53 @@ jobs:
             echo "$u: last observation $ts (${age}s ago)"
             test "$age" -lt 129600
           done
+
+      - name: Propagated index is internally consistent
+        # The invariant #34 was about: for every published package, every hard
+        # dependency WE publish must satisfy its version constraint. On 2026-08-26
+        # IRanges 2.47.3 shipped against S4Vectors 0.51.7 while requiring 0.51.8,
+        # which installs nowhere.
+        #
+        # The propagation gate now prevents that, but it only guards one of the
+        # three writers to index.json — /seed adds entries that never face the
+        # gate at all, and /reindex rewrites the recorded dependencies. This is
+        # the check that covers those, and it is deliberately an INDEPENDENT
+        # implementation of the rule rather than a call into the Worker's own
+        # code: a check that shares the gate's logic cannot catch the gate being
+        # wrong. The canary in install.yml would eventually notice by installing
+        # a broken package, but only if its random sample of 3 happened to hit
+        # one. This is deterministic and covers all ~2400 entries.
+        #
+        # Dependencies we do not publish (CRAN, and the annotation/experiment
+        # data packages with no build home until M2) are skipped: not ours to
+        # vouch for. Only >= and > are enforced, matching the gate and BBS.
+        run: |
+          set -o pipefail
+          cat > /tmp/consistency.jq <<'JQ'
+          def vparse: [splits("[.-]")] | map(tonumber? // 0);
+          . as $idx
+          | (to_entries | map({key, value: .value.version}) | from_entries) as $pub
+          | [ to_entries[]
+              | .key as $pkg | .value.version as $ver
+              | (.value.desc // {}) as $d
+              | (($d.Depends // ""), ($d.Imports // ""), ($d.LinkingTo // ""))
+              | split(",")[]
+              | select(test("\\("))
+              | capture("^\\s*(?<n>[A-Za-z][A-Za-z0-9._]*)\\s*\\(\\s*(?<op>>=?)\\s*(?<v>[0-9][0-9.-]*)")
+              | select($pub[.n] != null)
+              | select(
+                  ($pub[.n] | vparse) as $have | (.v | vparse) as $want
+                  | if .op == ">=" then $have < $want else $have <= $want end
+                )
+              | "\($pkg) \($ver) needs \(.n) \(.op) \(.v), published \($pub[.n])"
+            ]
+          JQ
+          rc=0
+          for u in bioc bioc-release; do
+            curl -fsS "https://bioc-registry.seandavi.workers.dev/data/prop/$u/index.json" \
+              | jq -f /tmp/consistency.jq > "/tmp/$u-bad.json"
+            n=$(jq length "/tmp/$u-bad.json")
+            echo "$u: $n unsatisfiable dependency edges"
+            if [ "$n" -gt 0 ]; then jq -r '.[]' "/tmp/$u-bad.json" | head -40; rc=1; fi
+          done
+          exit $rc
