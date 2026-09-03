@@ -73,10 +73,82 @@ export type PropIndex = Record<string, {
   origin?: Origin;
 }>;
 
-export type Origin = "r-universe" | "bioconductor";
+export type Origin = "r-universe" | "bioconductor" | "bioc-build";
 
 // Entries predating the field are propagations, which is what they are.
 export const originOf = (e: { origin?: Origin }): Origin => e.origin ?? "r-universe";
+
+// ---------- publish (bioc-build ingest, issue #12) ----------
+// POST /publish body per SPEC-014. `entry` is absent for a failed/rejected build
+// (attempt-only record); `attempt.ts` defaults to "now" by the caller when absent.
+export type PublishEntry = {
+  version: string; sha256: string; ts?: string;
+  bioccheck?: string | null; archs?: string[]; artifacts: Artifact[];
+  desc: Desc; meta?: Meta; origin: "bioc-build";
+};
+export type PublishAttempt = { commit: string; status: string; run_url?: string; ts?: string };
+export type PublishBody = {
+  universe: string; package: string; run_id: string;
+  attempt: PublishAttempt; entry?: PublishEntry;
+};
+
+const PKG_NAME_RE = /^[A-Za-z][A-Za-z0-9.]*$/;
+const SHA256_RE = /^[0-9a-f]{64}$/i;
+
+// Pure request validator — every reason a publish.yml bug or a forged request
+// should get a 400 instead of writing to R2, checked in one place.
+export function validatePublish(
+  body: unknown, universes: readonly string[]
+): { ok: true; value: PublishBody } | { ok: false; reason: string } {
+  const b = body as Partial<PublishBody> | null;
+  if (!b || typeof b !== "object") return { ok: false, reason: "body must be an object" };
+  if (!universes.includes(b.universe as string)) return { ok: false, reason: "invalid universe" };
+  if (typeof b.package !== "string" || !PKG_NAME_RE.test(b.package))
+    return { ok: false, reason: "invalid package name" };
+  if (typeof b.run_id !== "string" || !b.run_id) return { ok: false, reason: "missing run_id" };
+  const a = b.attempt;
+  if (!a || typeof a !== "object" || typeof a.commit !== "string" || !a.commit || typeof a.status !== "string" || !a.status)
+    return { ok: false, reason: "invalid attempt" };
+  if (b.entry !== undefined) {
+    const e = b.entry as Partial<PublishEntry> | null;
+    if (!e || typeof e !== "object") return { ok: false, reason: "invalid entry" };
+    if (typeof e.version !== "string" || !e.version) return { ok: false, reason: "entry.version required" };
+    if (typeof e.sha256 !== "string" || !SHA256_RE.test(e.sha256))
+      return { ok: false, reason: "entry.sha256 must be 64 hex chars" };
+    if (!Array.isArray(e.artifacts) || e.artifacts[0]?.os !== "src" || !e.artifacts[0]?.file)
+      return { ok: false, reason: "entry.artifacts[0] must be a src artifact with a file" };
+    if (!e.desc || typeof e.desc !== "object" || !Object.keys(e.desc).length)
+      return { ok: false, reason: "entry.desc must be non-empty" };
+    if (e.origin !== "bioc-build") return { ok: false, reason: "entry.origin must be bioc-build" };
+  }
+  return { ok: true, value: b as PublishBody };
+}
+
+// ponytail: JSON.stringify equality, not a structural deep-equal. Both sides are
+// built the same way (self-heal re-sends the stored entry verbatim), so key order
+// matches on the no-op path that matters; upgrade to real deep-equal if a
+// byte-different-but-equivalent payload ever causes a spurious index write.
+export function upsertEntry(
+  idx: PropIndex, pkg: string, entry: PropIndex[string]
+): { idx: PropIndex; changed: boolean } {
+  const prev = idx[pkg];
+  if (prev && JSON.stringify(prev) === JSON.stringify(entry)) return { idx, changed: false };
+  return { idx: { ...idx, [pkg]: entry }, changed: true };
+}
+
+export type AttemptRecord = {
+  commit: string; status: string; run_id: string; run_url: string; ts: string; attempts: number;
+};
+
+// attempts increments on a repeated attempt at the same commit, resets to 1 when
+// the upstream commit moves — the signal dispatch.yml's failed:-with-attempts>=3
+// backoff reads.
+export function mergeAttempt(
+  prev: AttemptRecord | undefined,
+  next: { commit: string; status: string; run_id: string; run_url: string; ts: string }
+): AttemptRecord {
+  return { ...next, attempts: prev && prev.commit === next.commit ? prev.attempts + 1 : 1 };
+}
 
 export type Sel = { os: string; r?: string; arch?: string; distro?: string };
 

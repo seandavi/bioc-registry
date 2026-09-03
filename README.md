@@ -209,6 +209,23 @@ tick or two. `wrangler tail` reports
 spurious "code had hung" errors for workflow runs — check instance status
 instead, they complete fine.
 
+The publisher (`.github/workflows/publish.yml`, `scripts/publish.sh`, SPEC-014
+issue #13) is separate from the worker and runs as a GitHub Actions cron in
+*this* repo, not on Cloudflare — it needs its own four repository secrets
+(`MAINT_KEY`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ACCOUNT_ID`, from
+GSM `cdsci-bioc-registry-maint-key`, `cdsci-r2-access-key-id`,
+`cdsci-r2-secret-access-key`, `cdsci-r2-account-id`) and skips itself with a
+`::notice::` when `MAINT_KEY` is unset, so an unconfigured fork's cron is a
+no-op rather than a failure. Run it manually with `gh workflow run publish.yml`,
+or locally against the real bioc-build runs with
+`MAINT_KEY=… R2_ACCESS_KEY_ID=… R2_SECRET_ACCESS_KEY=… R2_ACCOUNT_ID=… GH_TOKEN=$(gh auth token) bash scripts/publish.sh --dry-run`
+(drop `--dry-run` to actually upload and POST). Its state lives entirely in the
+bucket, at `state/bioc-build/attempts.json` (every attempt, success or not —
+also read by bioc-build's own `dispatch.yml` to avoid re-attempting a commit
+that just failed) and `state/bioc-build/published.json` (every entry it has
+published, re-POSTed each run to self-heal an index a later r-universe write
+clobbered).
+
 ## Citing, licence, conduct
 
 - Cite via [CITATION.cff](CITATION.cff) (GitHub's "Cite this repository")

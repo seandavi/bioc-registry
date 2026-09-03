@@ -1,0 +1,41 @@
+name: publish
+# The bioc-build publisher (issue #13, SPEC-014). Sweeps completed build.yml
+# runs on seandavi/bioc-build, verifies each staged package, and publishes it
+# through the guarded POST /publish route — see scripts/publish.sh for the
+# algorithm. This is the only workflow in this repo holding write credentials
+# to R2, so it stays a thin wrapper: secrets in, everything else in the script.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: run publisher
+        env:
+          MAINT_KEY: ${{ secrets.MAINT_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          # AWS CLI reads these two directly; R2 has no separate profile concept.
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # gh needs a token even for reads against the public bioc-build repo —
+          # unauthenticated requests hit a much lower rate limit, and only this
+          # token (not the repo's own contents:read) can call gh attestation
+          # verify and gh run download against another repository.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$MAINT_KEY" ]; then
+            echo "::notice::publisher secrets not set; skipping"
+            exit 0
+          fi
+          bash scripts/publish.sh
