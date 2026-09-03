@@ -140,14 +140,20 @@ export type AttemptRecord = {
   commit: string; status: string; run_id: string; run_url: string; ts: string; attempts: number;
 };
 
-// attempts increments on a repeated attempt at the same commit, resets to 1 when
-// the upstream commit moves — the signal dispatch.yml's failed:-with-attempts>=3
-// backoff reads.
+// attempts counts distinct RUNS at the same commit (dispatch.yml's
+// failed:-with-attempts>=3 backoff signal), not POSTs: publish.yml's self-heal
+// re-POSTs the same run_id every sweep, and that must not inflate the count.
+// So: same commit + same run_id (a re-POST) keeps the prior count; same commit
+// + a different run_id (a real retry) increments; a new commit resets to 1.
 export function mergeAttempt(
   prev: AttemptRecord | undefined,
   next: { commit: string; status: string; run_id: string; run_url: string; ts: string }
 ): AttemptRecord {
-  return { ...next, attempts: prev && prev.commit === next.commit ? prev.attempts + 1 : 1 };
+  const attempts =
+    !prev || prev.commit !== next.commit ? 1
+    : prev.run_id === next.run_id ? prev.attempts
+    : prev.attempts + 1;
+  return { ...next, attempts };
 }
 
 export type Sel = { os: string; r?: string; arch?: string; distro?: string };
