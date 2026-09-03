@@ -109,6 +109,14 @@ test("mergeAttempt increments on a repeated attempt at the same commit", () => {
   assert.equal(next.attempts, 2);
 });
 
+test("mergeAttempt does NOT increment on a self-heal re-POST (same commit, same run_id)", () => {
+  const prev = mergeAttempt(undefined, { commit: "c1", status: "ok", run_id: "1", run_url: "u", ts: "t1" });
+  const resweep = mergeAttempt(prev, { commit: "c1", status: "ok", run_id: "1", run_url: "u", ts: "t2" });
+  assert.equal(resweep.attempts, 1);
+  const resweepAgain = mergeAttempt(resweep, { commit: "c1", status: "ok", run_id: "1", run_url: "u", ts: "t3" });
+  assert.equal(resweepAgain.attempts, 1);
+});
+
 test("mergeAttempt resets to 1 when the commit moves", () => {
   const prev = mergeAttempt(undefined, { commit: "c1", status: "failed:check", run_id: "1", run_url: "u", ts: "t1" });
   const next = mergeAttempt(prev, { commit: "c2", status: "ok", run_id: "2", run_url: "u", ts: "t2" });
