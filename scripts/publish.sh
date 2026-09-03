@@ -89,11 +89,18 @@ manifest_get() {
 # publish.test.sh can run the exact same transform against a fixture.
 build_entry() {
   local staged_file="$1" sha256="$2" ts="$3"
-  # TZ=UTC: jq's fromdateiso8601 (below) mis-converts a "Z" timestamp by the
-  # local zone's DST offset on some jq 1.6 builds unless the process is
-  # already in UTC — verified wrong by up to 1h in MDT. GH runners default to
-  # UTC, but --dry-run is meant to run locally too, so pin it explicitly.
-  TZ=UTC jq -n --slurpfile s "$staged_file" --arg sha256 "$sha256" --arg ts "$ts" '
+  # source.commit_time is `git log -1 --format=%cI` — ISO 8601 WITH a numeric
+  # zone offset (e.g. "...-04:00"), not "Z". jq's fromdateiso8601 only parses
+  # "Z" and hard-errors on an offset (hit for real: a bioc-build sweep died on
+  # "2026-04-28T08:25:25-04:00 does not match format %Y-%m-%dT%H:%M:%SZ").
+  # GNU date parses either, so the conversion happens here, in bash, before jq
+  # ever sees it — and a missing or unparseable value just omits
+  # meta.commit.time rather than failing the whole publish.
+  local commit_time_raw commit_time_epoch=""
+  commit_time_raw=$(jq -r '.source.commit_time // empty' "$staged_file")
+  [[ -n "$commit_time_raw" ]] && commit_time_epoch=$(date -d "$commit_time_raw" +%s 2>/dev/null || true)
+  jq -n --slurpfile s "$staged_file" --arg sha256 "$sha256" --arg ts "$ts" \
+    --arg commit_time_epoch "$commit_time_epoch" '
     ($s[0]) as $staged |
     {
       version: $staged.version,
@@ -111,15 +118,9 @@ build_entry() {
       # null description/meta fields (staged.json marks an absent field null,
       # not omitted) must not reach the index — Desc/Meta are string-only.
       desc: ($staged.description | with_entries(select(.value != null))),
-      # Meta.commit.time is a Unix timestamp (repo.ts), matching every other
-      # producer (r-universe _commit.time); staged.json source.commit_time is
-      # ISO 8601 (git log -1 --format=%cI), so it is converted here. Omitted
-      # entirely when build.yml has not started recording commit_time yet.
       meta: (($staged.meta // {} | with_entries(select(.value != null)))
              + { commit: ({ id: $staged.source.commit } +
-                          (if $staged.source.commit_time then
-                             { time: ($staged.source.commit_time | fromdateiso8601) }
-                           else {} end)),
+                          (if $commit_time_epoch != "" then { time: ($commit_time_epoch | tonumber) } else {} end)),
                  git_url: $staged.source.git_url })
     }'
 }
@@ -257,13 +258,49 @@ process_artifact() {
   publish_ok "$universe" "$pkg" "$run_id" "$commit" "$run_url" "$staged" "$tarball_sha" "$idxfile"
 }
 
+# process_artifact_safe <run_id> <run_url> <artifact_dir> <idx_bioc> <idx_release> <attempts_file> <artifact_name>
+# SPEC-014: one bad artifact must never abort the sweep. This runs
+# process_artifact in a genuinely separate `bash` PROCESS, not a `(...)`
+# subshell of this one — verified the hard way: bash's errexit is deliberately
+# ignored while evaluating the tested command of an if/while or a non-last
+# member of an AND-OR list, and that suppression reaches into any subshell
+# forked for it too, so a crashing command in there (a malformed staged.json,
+# a jq filter erroring, ...) does not stop execution — it just leaves
+# $pkg/$stream etc empty and silently limps on to a bogus "success", and
+# nothing short of a real process boundary (which starts with none of that
+# suppression, regardless of how process_artifact_safe itself was called)
+# reliably catches it. Only DRY_RUN needs forwarding explicitly: everything
+# else process_artifact needs is either a real environment variable already
+# (the secrets) or re-derived by re-sourcing this file fresh in the child.
+#
+# On failure, records a best-effort attempt using the package/stream parsed
+# from the ARTIFACT NAME (staged.json itself may be exactly what is broken,
+# so it cannot be trusted here) and reports failure to the caller so it can
+# move on to the next artifact instead of the whole script exiting.
+process_artifact_safe() {
+  local run_id="$1" run_url="$2" adir="$3" idx_bioc="$4" idx_release="$5" attempts_file="$6" name="$7"
+  local status=0
+  DRY_RUN="${DRY_RUN:-0}" bash -euo pipefail -c '
+    source "$1"; shift
+    process_artifact "$@"
+  ' _ "${BASH_SOURCE[0]}" "$run_id" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file" || status=$?
+  [[ "$status" -eq 0 ]] && return 0
+  log "run $run_id: $name errored during processing, recording rejected:internal-error and continuing"
+  record_attempt "$(universe_of_stream "$(stream_of "$name")")" "$(package_of "$name")" \
+    "$run_id" "" "rejected:internal-error" "$run_url" || true
+  return 1
+}
+
 main() {
   DRY_RUN=0
   [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
   [[ "$DRY_RUN" == 1 ]] || : "${MAINT_KEY:?MAINT_KEY not set}" "${R2_ACCESS_KEY_ID:?}" "${R2_SECRET_ACCESS_KEY:?}" "${R2_ACCOUNT_ID:?}"
 
-  local WORK; WORK="$(mktemp -d)"
-  trap 'rm -rf "$WORK"' EXIT
+  # WORK is a plain global (not `local`), set with its cleanup trap at the
+  # bottom of this file BEFORE main is called — not here. A `local` here was
+  # observed unbound when the EXIT trap fired after an error deep in a nested
+  # call (jq/gh/aws failures no longer reach that far — see
+  # process_artifact_safe — but a global sidesteps the whole class of bug).
 
   log "fetching attempts.json"
   local attempts_file="$WORK/attempts.json"
@@ -287,7 +324,7 @@ main() {
   fetch_or_empty "prop/bioc/index.json" > "$idx_bioc"
   fetch_or_empty "prop/bioc-release/index.json" > "$idx_release"
 
-  local n=0
+  local n=0 err=0
   while read -r run; do
     local rid run_url workflow names todo
     rid=$(jq -r '.databaseId' <<<"$run")
@@ -318,13 +355,15 @@ main() {
       local adir="$WORK/run-$rid/$name"
       mkdir -p "$adir"
       if gh run download "$rid" -R "$BUILD_REPO" -n "$name" -D "$adir" >/dev/null 2>&1; then
-        process_artifact "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file"
+        process_artifact_safe "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file" "$name" \
+          || err=$((err + 1))
       else
         log "run $rid: download failed for artifact $name"
+        err=$((err + 1))
       fi
     done
   done < <(jq -c '.[]' "$runs_file")
-  log "sweep done ($n run(s) with staged-* artifacts considered)"
+  log "sweep done ($n run(s) with staged-* artifacts considered, $err error(s))"
 
   log "self-heal: re-POSTing state/bioc-build/published.json"
   local published_file="$WORK/published.json"
@@ -343,14 +382,23 @@ main() {
       --argjson entry "$entry" --arg commit "$commit" --arg run_url "$run_url" --arg ts "$ts" \
       '{universe:$universe, package:$package, run_id:$run_id, entry:$entry,
         attempt:{commit:$commit, status:"ok", run_url:$run_url, ts:$ts}}')
-    post_publish "$body" >/dev/null || log "self-heal: $universe/$pkg POST failed"
+    post_publish "$body" >/dev/null || { log "self-heal: $universe/$pkg POST failed"; err=$((err + 1)); }
   done < <(jq -r 'to_entries[] | .key as $u | .value | keys[] | [$u, .] | @tsv' "$published_file")
+
+  # SPEC-014: one bad artifact must never abort the sweep — process_artifact_safe
+  # (and the download/self-heal failure paths above) makes sure of that. What the
+  # exit code reports instead is whether ANYTHING in this run needs a look.
+  [[ "$err" -eq 0 ]]
 }
 
 universe_of_stream_inverse() { [[ "$1" == "bioc" ]] && echo "devel" || echo "release"; }
 
 # Only run the sweep when executed directly — publish.test.sh sources this file
-# to reuse build_entry() against a fixture without running main().
+# to reuse build_entry() etc against a fixture without running main(). WORK is
+# a plain global, set (with its cleanup trap) here rather than as a `local`
+# inside main() — see the comment at the top of main() for why.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  WORK="$(mktemp -d)"
+  trap 'rm -rf "${WORK:-}"' EXIT
   main "$@"
 fi

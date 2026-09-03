@@ -64,6 +64,34 @@ else
 fi
 rm -f "$NO_TIME"
 
+# source.commit_time is `git log -1 --format=%cI`: ISO 8601 WITH a numeric
+# zone offset, not "Z". This is the exact shape that crashed a live sweep
+# (jq's fromdateiso8601 only parses "Z") — build_entry must convert it
+# correctly rather than erroring.
+OFFSET_TS="2026-04-28T08:25:25-04:00"
+EXPECTED_EPOCH=$(date -d "$OFFSET_TS" +%s)
+OFFSET=$(mktemp)
+jq --arg t "$OFFSET_TS" '.source.commit_time = $t' "$DIR/fixtures/staged.json" > "$OFFSET"
+ACTUAL_EPOCH=$(jq -r '.meta.commit.time' <<<"$(build_entry "$OFFSET" "$SHA" "$TS")")
+if [[ "$ACTUAL_EPOCH" == "$EXPECTED_EPOCH" ]]; then
+  echo "ok - build_entry converts a commit_time with a numeric zone offset"
+else
+  echo "not ok - build_entry offset conversion: got $ACTUAL_EPOCH, expected $EXPECTED_EPOCH" >&2
+  exit 1
+fi
+rm -f "$OFFSET"
+
+# An unparseable commit_time must not fail the whole publish — just the field.
+BAD_TIME=$(mktemp)
+jq '.source.commit_time = "not-a-date"' "$DIR/fixtures/staged.json" > "$BAD_TIME"
+if jq -e '.meta.commit | has("time") | not' <<<"$(build_entry "$BAD_TIME" "$SHA" "$TS")" >/dev/null; then
+  echo "ok - build_entry omits meta.commit.time when source.commit_time is unparseable"
+else
+  echo "not ok - build_entry should omit meta.commit.time when source.commit_time is unparseable" >&2
+  exit 1
+fi
+rm -f "$BAD_TIME"
+
 # version_gate_ok: a strict sort -V bump is required unless replacing an
 # origin:bioconductor seed at the same version.
 IDX=$(mktemp)
@@ -120,3 +148,36 @@ already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdat
   && { echo "not ok - already_recorded should not match a different run_id" >&2; exit 1; }
 rm -f "$ATT"
 echo "ok - already_recorded via parsed artifact name (precheck path)"
+
+# process_artifact_safe: SPEC-014 — one bad artifact must never abort the
+# sweep. Invalid JSON reproduces the real failure mode (a command deep in
+# process_artifact's call tree erroring under `set -e`, here jq itself on the
+# very first `.package` read) and must not stop a second, valid artifact from
+# still being processed right after it, in the same script/process.
+BADDIR=$(mktemp -d)
+echo 'not valid json' > "$BADDIR/staged.json"
+GOODDIR=$(mktemp -d)
+cp "$DIR/fixtures/staged.json" "$GOODDIR/staged.json"   # no tarball copied -> rejects, but that IS normal processing
+ATT2=$(mktemp); echo '{}' > "$ATT2"
+
+BAD_STATUS=0
+DRY_RUN=1 process_artifact_safe "1" "https://example/run/1" "$BADDIR" /dev/null /dev/null "$ATT2" "staged-broken-release" \
+  >/dev/null 2>&1 || BAD_STATUS=$?
+GOOD_STATUS=0
+GOOD_OUT=$(DRY_RUN=1 process_artifact_safe "2" "https://example/run/2" "$GOODDIR" /dev/null /dev/null "$ATT2" "staged-msdata-release" 2>&1) \
+  || GOOD_STATUS=$?
+
+if [[ "$BAD_STATUS" -ne 0 ]]; then
+  echo "ok - process_artifact_safe reports failure for a malformed staged.json instead of killing the script"
+else
+  echo "not ok - process_artifact_safe should have failed for a malformed staged.json" >&2
+  exit 1
+fi
+if [[ "$GOOD_STATUS" -eq 0 ]] && grep -q "rejected:no-tarball" <<<"$GOOD_OUT"; then
+  echo "ok - process_artifact_safe still processes a second, valid artifact after the first one errored"
+else
+  echo "not ok - the second artifact should still have been processed normally" >&2
+  echo "$GOOD_OUT" >&2
+  exit 1
+fi
+rm -rf "$BADDIR" "$GOODDIR" "$ATT2"
