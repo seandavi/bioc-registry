@@ -6,7 +6,8 @@ name: publish
 # to R2, so it stays a thin wrapper: secrets in, everything else in the script.
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # off-peak minutes: GitHub delays or drops schedules at :00/:30 under load
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:
