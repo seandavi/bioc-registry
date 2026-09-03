@@ -1,0 +1,51 @@
+{
+  "schema_version": "1",
+  "package": "msdata",
+  "version": "0.51.1",
+  "stream": "release",
+  "status": "ok",
+  "tarball": {
+    "file": "msdata_0.51.1.tar.gz",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size_bytes": 12345
+  },
+  "source": {
+    "git_url": "https://git.bioconductor.org/packages/msdata",
+    "branch": "RELEASE_3_23",
+    "commit": "deadbeefcafef00d",
+    "commit_time": "2026-08-09T00:12:34Z"
+  },
+  "manifest_commit": "abc123def456",
+  "policy_version": "2026.09.1",
+  "build": {
+    "run_id": "18234567890",
+    "run_attempt": 1,
+    "run_url": "https://github.com/seandavi/bioc-build/actions/runs/18234567890",
+    "container": "bioconductor/bioconductor_docker:RELEASE_3_23@sha256:deadbeef",
+    "r_version": "4.6.1"
+  },
+  "check": {
+    "status": "ok",
+    "bioccheck": "ok"
+  },
+  "description": {
+    "Depends": "R (>= 4.1.0)",
+    "Imports": null,
+    "Suggests": null,
+    "License": "Artistic-2.0",
+    "NeedsCompilation": "no",
+    "Priority": null,
+    "LinkingTo": null,
+    "Enhances": null,
+    "OS_type": null
+  },
+  "meta": {
+    "Title": "Various Mass Spectrometry raw data example files",
+    "Description": "Provides mass spectrometry data for use in examples and vignettes.",
+    "URL": null,
+    "BugReports": null,
+    "Maintainer": "MSnbase Developers <maintainer@example.org>",
+    "Author": null,
+    "biocViews": "ExperimentData, MassSpectrometryData"
+  }
+}

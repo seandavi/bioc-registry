@@ -8,6 +8,7 @@ import {
   planCompaction, parseZipCentral, isLogEntry, buildManifest,
   invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
   viewsDcf, writeOnce, JobRow, RowState,
+  validatePublish, upsertEntry, mergeAttempt, AttemptRecord,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -957,6 +958,10 @@ type Summary = {
   // until r-universe propagates the package, so this only grows; visible beats
   // silent drift, and beats re-seeding on a timer.
   seedBehind: number;
+  // Entries from bioc-build (issue #12): never faced this gate either, but unlike
+  // a seed they DID build and check somewhere — just not through r-universe. Kept
+  // out of `propagated` and `seeded` so neither count silently absorbs them.
+  built: number;
   rMinor: string;
 };
 
@@ -989,8 +994,10 @@ async function summarize(universe: string, env: Env): Promise<Summary | null> {
   // it. Counted apart, and labelled apart on the dashboard.
   const entries = Object.entries(idx);
   const seededEntries = entries.filter(([, e]) => originOf(e) === "bioconductor");
+  const builtEntries = entries.filter(([, e]) => originOf(e) === "bioc-build");
   const seeded = seededEntries.length;
-  const propagated = entries.length - seeded;
+  const built = builtEntries.length;
+  const propagated = entries.length - seeded - built;
   const official = await env.ARCHIVE.get(`prop/${universe}/seed/official-versions.json`);
   const officialVer = official ? await official.json<Record<string, string>>() : {};
   const seedBehind = seededEntries
@@ -1011,6 +1018,7 @@ async function summarize(universe: string, env: Env): Promise<Summary | null> {
     propagated,
     seeded,
     seedBehind,
+    built,
   };
 }
 
@@ -1085,6 +1093,7 @@ function universeHtml(s: Summary, now: number): string {
     <div class="tile"><b>${s.propagated}</b><span>propagated</span></div>
     ${s.seeded ? `<div class="tile"><b>${s.seeded}</b><span>seeded from Bioconductor</span></div>` : ""}
     ${s.seedBehind ? `<div class="tile"><b>${s.seedBehind}</b><span>seeded, now behind official</span></div>` : ""}
+    ${s.built ? `<div class="tile"><b>${s.built}</b><span>built by bioc-build</span></div>` : ""}
   </div>
   <table>
     <thead><tr><th>config</th>${statuses.map((st) => `<th>${esc(st)}</th>`).join("")}</tr></thead>
@@ -1282,9 +1291,14 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
   // A seeded entry never faced the gate, so saying "propagated" of it would be a
   // claim we did not make. Its bioccheck is null and its archs empty by
   // construction — the tiles say where it came from instead of implying a verdict.
+  // A bioc-build entry (issue #12) is a third case: it never faced THIS gate
+  // either, but it did build and check in bioc-build's own CI, so it keeps its
+  // bioccheck tile rather than the "not gated here" one seeded entries get.
   const seeded = prop && originOf(prop) === "bioconductor";
+  const builtByBiocBuild = prop && originOf(prop) === "bioc-build";
+  const propOriginLabel = seeded ? "seeded" : builtByBiocBuild ? "built by bioc-build" : "propagated";
   const propHtml = prop
-    ? `<div class="tile"><b>${esc(prop.version)}</b><span>${seeded ? "seeded" : "propagated"} ${age(prop.ts, now)}</span></div>
+    ? `<div class="tile"><b>${esc(prop.version)}</b><span>${propOriginLabel} ${age(prop.ts, now)}</span></div>
        <div class="tile"><b>${prop.artifacts.length}</b><span>artifacts</span></div>
        ${seeded
          ? `<div class="tile"><b>Bioconductor</b><span>origin — not gated here</span></div>`
@@ -1438,7 +1452,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
     if (
       env.MAINT_KEY &&
       (pathname === "/poll" || pathname === "/reindex" || pathname === "/backfill" ||
-        pathname === "/seed") &&
+        pathname === "/seed" || pathname === "/publish") &&
       req.headers.get("x-maint-key") !== env.MAINT_KEY
     ) {
       return new Response("forbidden", { status: 403 });
@@ -1446,6 +1460,60 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
     if (pathname === "/poll") {
       const results = await Promise.all([...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env)]);
       return new Response(results.join("\n") + "\n");
+    }
+    if (pathname === "/publish") {
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const json = (obj: unknown, status = 200) =>
+        new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+      let body: unknown;
+      try { body = await req.json(); } catch { return json({ error: "invalid JSON body" }, 400); }
+      const v = validatePublish(body, UNIVERSES);
+      if (!v.ok) return json({ error: v.reason }, 400);
+      const { universe, package: pkg, run_id, attempt, entry } = v.value;
+      if (entry && !(await env.ARCHIVE.head(`prop/${universe}/cas/${entry.sha256}`)))
+        return json({ error: "cas object missing" }, 409);
+
+      let changed = false;
+      let log_key: string | undefined;
+      if (entry) {
+        // publish.yml's self-heal re-POSTs every entry in published.json every
+        // sweep, so the SAME entry arrives here forever. Its ts must be STABLE
+        // across those re-POSTs — entry.ts, as stored — rather than attempt.ts
+        // or "now": otherwise upsertEntry's deep-equal never matches, `changed`
+        // is never false, and a fresh (or, at a stable ts, silently clobbered
+        // write-once) ledger record gets written on every single sweep forever.
+        const storedEntry = { ...entry, ts: entry.ts || attempt.ts || new Date().toISOString() };
+        // Compute the upsert BEFORE writing anything: a true no-op (byte-
+        // identical entry) writes nothing at all — no log, no index, no
+        // published.json — which is what makes a self-heal sweep actually cheap.
+        const idx = await readIndex(env, universe);
+        const up = upsertEntry(idx, pkg, storedEntry);
+        changed = up.changed;
+        if (changed) {
+          log_key = `prop/${universe}/log/${storedEntry.ts}-${pkg}_${storedEntry.version}.json`;
+          await env.ARCHIVE.put(log_key, JSON.stringify({ package: pkg, run_id, ...storedEntry }));
+          await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(up.idx));
+          const publishedObj = await env.ARCHIVE.get("state/bioc-build/published.json");
+          const published: Record<string, Record<string, PropIndex[string]>> =
+            publishedObj ? await publishedObj.json() : {};
+          published[universe] ??= {};
+          published[universe][pkg] = storedEntry;
+          await env.ARCHIVE.put("state/bioc-build/published.json", JSON.stringify(published));
+        }
+      }
+
+      const stream = universe === "bioc" ? "devel" : "release";
+      const ts = attempt.ts || new Date().toISOString();
+      const attemptsObj = await env.ARCHIVE.get("state/bioc-build/attempts.json");
+      const attempts: Record<string, Record<string, AttemptRecord>> =
+        attemptsObj ? await attemptsObj.json() : {};
+      attempts[pkg] ??= {};
+      attempts[pkg][stream] = mergeAttempt(attempts[pkg][stream], {
+        commit: attempt.commit, status: attempt.status, run_id, run_url: attempt.run_url ?? "", ts,
+      });
+      await env.ARCHIVE.put("state/bioc-build/attempts.json", JSON.stringify(attempts));
+
+      return json({ ok: true, changed, log_key });
     }
     if (pathname.startsWith("/data/")) {
       const key = decodeURIComponent(pathname.slice(6));

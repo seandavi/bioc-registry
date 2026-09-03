@@ -3,9 +3,9 @@
 Base URL: `https://bioc-registry.seandavi.workers.dev`
 
 Everything is read-only GET and unauthenticated, except the maintenance routes
-(`/poll`, `/backfill`, `/reindex`, `/seed`), which require an `x-maint-key` header
-matching the `MAINT_KEY` worker secret when one is set. All data
-endpoints serve straight from the R2 bucket, so responses are exactly the
+(`/poll`, `/backfill`, `/reindex`, `/seed`, `/publish`), which require an
+`x-maint-key` header matching the `MAINT_KEY` worker secret when one is set. All
+data endpoints serve straight from the R2 bucket, so responses are exactly the
 stored objects — this API adds Range/CORS plumbing, not transformation.
 
 ## Routes
@@ -326,6 +326,57 @@ Binaries come only from the binary directory's own `PACKAGES` at a matching
 version — the counts differ from source (release: 2384 source, 2305 Windows,
 2332 arm64, 2361 Intel), so a binary is never assumed to exist.
 
+### `POST /publish`
+
+Maintenance, side-effecting — like `/poll` and `/seed`, guarded by `x-maint-key`
+and documented here rather than in `/openapi.json` (see the omission note at the
+top of `src/openapi.ts`: a try-it button next to a write route gated only by a
+shared secret is an invitation). Called by `publish.yml` in this repo, once per
+completed `build.yml` run on `seandavi/bioc-build` (SPEC-014).
+
+Body:
+
+```json
+{
+  "universe": "bioc-release", "package": "msdata", "run_id": "18234567890",
+  "entry": {
+    "version": "0.51.1", "sha256": "…", "bioccheck": "ok", "archs": ["linux"],
+    "origin": "bioc-build",
+    "artifacts": [{ "os": "src", "r": "4.6", "sha256": "…", "file": "msdata_0.51.1.tar.gz" }],
+    "desc": { "License": "Artistic-2.0" },
+    "meta": { "Title": "msdata", "commit": { "id": "…", "time": 1786329705 }, "git_url": "…" }
+  },
+  "attempt": { "commit": "…", "status": "ok", "run_url": "https://github.com/…/runs/18234567890", "ts": "…" }
+}
+```
+
+`entry` is omitted for a failed build or a build the publisher's own checks
+reject (version gate, manifest state, attestation) — `attempt.status` then reads
+`failed:<stage>` or `rejected:<check>` and only the attempts record is written.
+
+400 with `{"error": "<reason>"}` on a malformed body (bad universe, bad package
+name, `entry.sha256` not 64 hex chars, `entry.artifacts[0]` not a `src` artifact,
+empty `entry.desc`, or `entry.origin` not `"bioc-build"`). 409
+`{"error": "cas object missing"}` if `entry` is given but
+`prop/{universe}/cas/{entry.sha256}` has not been uploaded yet — `publish.yml`
+uploads the tarball to the CAS before calling this route.
+
+On success: writes `prop/{universe}/log/{ts}-{package}_{version}.json` (the
+ledger entry, write-once, same shape `/seed` writes) *before* touching the
+index — matching that precedent, so an index entry never exists without a log
+entry behind it. Then reads `prop/{universe}/index.json`, upserts the package,
+and writes it back only if the entry actually changed. Also merges
+`state/bioc-build/attempts.json` and, when `entry` is present,
+`state/bioc-build/published.json` (see [Storage keys](#storage-keys) below).
+
+Responds `{"ok": true, "changed": true|false, "log_key": "…" }` — `changed` is
+`false` when the index already held byte-identical content, which is what makes
+`publish.yml`'s self-heal re-POST of every `published.json` entry a no-op most
+of the time: a later r-universe read-modify-write of the same
+`prop/{universe}/index.json` can clobber this route's write, and the cron
+notices and repairs it on its next run rather than the route trying to hold a
+lock across two producers.
+
 ## Storage keys
 
 All addressable through `/data/<key>`.
@@ -350,6 +401,8 @@ All addressable through `/data/<key>`.
 | `prop/{universe}/seed/plan.json` | what a `/seed` run intends to seed: package, version, desc, meta, artifact paths |
 | `prop/{universe}/seed/official-versions.json` | every package version the official Bioconductor repo ships, for the seeded-drift count |
 | `prop/{universe}/log/{ts}-{pkg}_{ver}.json` | propagation ledger entry |
+| `state/bioc-build/attempts.json` | `{ [package]: { [stream]: {commit, status, run_id, run_url, ts, attempts} } }` — every `/publish` attempt, one/two-stream, `stream` is `devel` (universe `bioc`) or `release` (universe `bioc-release`); read by `dispatch.yml` in bioc-build to skip a commit already attempted, and back off after repeated failures |
+| `state/bioc-build/published.json` | `{ [universe]: { [package]: <index entry> } }` — every entry `/publish` has ever accepted, re-POSTed by `publish.yml` each run so an index clobbered by a later r-universe write self-heals |
 
 `{universe}` is `bioc` (devel) or `bioc-release`. `{digest12}` is the first 12
 hex chars of the observation body's sha256.
@@ -480,7 +533,12 @@ propagation, on seeding, and for existing entries by `/reindex`.
 
 `origin` says where the entry came from: `r-universe` for anything that passed
 the gate, `bioconductor` for an entry seeded from Bioconductor's own release
-build. A seeded entry has an empty `archs` and a null `bioccheck` because it
-never faced this gate at all — without `origin` it would be indistinguishable
-from a gate verdict that was never made. Entries written before the field
-existed are propagations and read as `r-universe`.
+build, `bioc-build` for an entry from bioc-build's own CI, published through
+`POST /publish` (SPEC-014). A seeded entry has an empty `archs` and a null
+`bioccheck` because it never faced this gate at all — without `origin` it would
+be indistinguishable from a gate verdict that was never made. A `bioc-build`
+entry, unlike a seeded one, DID build and check somewhere — just not through
+r-universe — so it carries a real `bioccheck` and `archs`; the dashboard and
+package page count and label it separately from both `r-universe` and
+`bioconductor` entries rather than folding it into either. Entries written
+before the field existed are propagations and read as `r-universe`.

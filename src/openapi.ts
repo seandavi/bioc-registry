@@ -3,9 +3,9 @@
 // docs/api.md are updated with it — nothing here is generated, so nothing breaks
 // loudly when it drifts.
 //
-// Deliberately omitted: /poll, /backfill, /reindex, /seed. They are side-effecting
-// GETs gated only by a shared secret, and a try-it button next to /backfill is an
-// invitation.
+// Deliberately omitted: /poll, /backfill, /reindex, /seed, /publish. They are
+// side-effecting routes gated only by a shared secret, and a try-it button next
+// to /backfill (or /publish) is an invitation. See docs/api.md for these instead.
 
 const UNIVERSE = {
   name: "universe",
