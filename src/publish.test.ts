@@ -83,6 +83,13 @@ test("upsertEntry is a no-op when the entry is identical (self-heal re-POST)", (
   assert.equal(idx, idx0);
 });
 
+test("upsertEntry is NOT a no-op when only ts differs — why /publish must reuse entry.ts (not attempt.ts/now) across a self-heal re-POST, or every sweep would write a fresh log record forever", () => {
+  const idx0: PropIndex = { msdata: ENTRY as unknown as PropIndex[string] };
+  const freshTs = { ...ENTRY, ts: "2026-09-03T00:00:01Z" } as unknown as PropIndex[string];
+  const { changed } = upsertEntry(idx0, "msdata", freshTs);
+  assert.equal(changed, true);
+});
+
 test("upsertEntry reports changed when the version differs", () => {
   const idx0: PropIndex = { msdata: ENTRY as unknown as PropIndex[string] };
   const next = { ...ENTRY, version: "0.51.2" } as unknown as PropIndex[string];

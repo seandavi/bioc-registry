@@ -1472,20 +1472,38 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       const { universe, package: pkg, run_id, attempt, entry } = v.value;
       if (entry && !(await env.ARCHIVE.head(`prop/${universe}/cas/${entry.sha256}`)))
         return json({ error: "cas object missing" }, 409);
-      const ts = attempt.ts || new Date().toISOString();
+
       let changed = false;
       let log_key: string | undefined;
-      // Log record before the index, same order as seedBatch — the ledger entry
-      // for a version must exist before that version can appear as "current".
       if (entry) {
-        log_key = `prop/${universe}/log/${ts}-${pkg}_${entry.version}.json`;
-        await env.ARCHIVE.put(log_key, JSON.stringify({ package: pkg, run_id, ...entry, ts }));
+        // publish.yml's self-heal re-POSTs every entry in published.json every
+        // sweep, so the SAME entry arrives here forever. Its ts must be STABLE
+        // across those re-POSTs — entry.ts, as stored — rather than attempt.ts
+        // or "now": otherwise upsertEntry's deep-equal never matches, `changed`
+        // is never false, and a fresh (or, at a stable ts, silently clobbered
+        // write-once) ledger record gets written on every single sweep forever.
+        const storedEntry = { ...entry, ts: entry.ts || attempt.ts || new Date().toISOString() };
+        // Compute the upsert BEFORE writing anything: a true no-op (byte-
+        // identical entry) writes nothing at all — no log, no index, no
+        // published.json — which is what makes a self-heal sweep actually cheap.
         const idx = await readIndex(env, universe);
-        const up = upsertEntry(idx, pkg, { ...entry, ts });
+        const up = upsertEntry(idx, pkg, storedEntry);
         changed = up.changed;
-        if (changed) await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(up.idx));
+        if (changed) {
+          log_key = `prop/${universe}/log/${storedEntry.ts}-${pkg}_${storedEntry.version}.json`;
+          await env.ARCHIVE.put(log_key, JSON.stringify({ package: pkg, run_id, ...storedEntry }));
+          await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(up.idx));
+          const publishedObj = await env.ARCHIVE.get("state/bioc-build/published.json");
+          const published: Record<string, Record<string, PropIndex[string]>> =
+            publishedObj ? await publishedObj.json() : {};
+          published[universe] ??= {};
+          published[universe][pkg] = storedEntry;
+          await env.ARCHIVE.put("state/bioc-build/published.json", JSON.stringify(published));
+        }
       }
+
       const stream = universe === "bioc" ? "devel" : "release";
+      const ts = attempt.ts || new Date().toISOString();
       const attemptsObj = await env.ARCHIVE.get("state/bioc-build/attempts.json");
       const attempts: Record<string, Record<string, AttemptRecord>> =
         attemptsObj ? await attemptsObj.json() : {};
@@ -1494,14 +1512,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
         commit: attempt.commit, status: attempt.status, run_id, run_url: attempt.run_url ?? "", ts,
       });
       await env.ARCHIVE.put("state/bioc-build/attempts.json", JSON.stringify(attempts));
-      if (entry) {
-        const publishedObj = await env.ARCHIVE.get("state/bioc-build/published.json");
-        const published: Record<string, Record<string, PropIndex[string]>> =
-          publishedObj ? await publishedObj.json() : {};
-        published[universe] ??= {};
-        published[universe][pkg] = { ...entry, ts };
-        await env.ARCHIVE.put("state/bioc-build/published.json", JSON.stringify(published));
-      }
+
       return json({ ok: true, changed, log_key });
     }
     if (pathname.startsWith("/data/")) {
