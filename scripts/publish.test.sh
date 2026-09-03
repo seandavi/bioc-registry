@@ -100,3 +100,23 @@ else
   echo "ok - process_artifact does not skip a different run_id for the same package/stream"
 fi
 rm -rf "$ATT" "$ADIR"
+
+# package_of/stream_of: "staged-<package>-<stream>" splits on the LAST "-",
+# which is unambiguous only because package names may never contain one
+# (dots are fine, e.g. Bioconductor annotation packages).
+[[ "$(package_of staged-msdata-release)" == "msdata" ]] || { echo "not ok - package_of staged-msdata-release" >&2; exit 1; }
+[[ "$(stream_of staged-msdata-release)" == "release" ]] || { echo "not ok - stream_of staged-msdata-release" >&2; exit 1; }
+[[ "$(package_of staged-org.Hs.eg.db-devel)" == "org.Hs.eg.db" ]] || { echo "not ok - package_of with dots in the name" >&2; exit 1; }
+echo "ok - package_of/stream_of"
+
+# The precheck (main's todo[] loop) must skip a run by NAME alone, before any
+# download — this is what keeps a multi-GB data package from being
+# re-fetched every 30 min. already_recorded is exactly what that loop calls.
+ATT=$(mktemp)
+echo '{"msdata": {"release": {"run_id": "999"}}}' > "$ATT"
+already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "999" "$ATT" \
+  || { echo "not ok - already_recorded should match by parsed name at the same run_id" >&2; exit 1; }
+already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "222" "$ATT" \
+  && { echo "not ok - already_recorded should not match a different run_id" >&2; exit 1; }
+rm -f "$ATT"
+echo "ok - already_recorded via parsed artifact name (precheck path)"

@@ -3,16 +3,18 @@ set -euo pipefail
 
 # scripts/publish.sh — the bioc-build publisher (issue #13, SPEC-014 "publish.yml").
 #
-# Sweeps completed runs on seandavi/bioc-build@main and downloads every
-# staged-* artifact they hold (a matrix run of dispatch.yml holds one per
-# package/stream, all sharing that run's run_id, since it calls build.yml via
-# `uses:` rather than dispatching it separately). For each staged-<pkg>-<stream>
-# artifact not already recorded in state/bioc-build/attempts.json AT THIS EXACT
-# run_id: verifies the tarball (sha256 + gh attestation) and the manifest it
-# built against, applies the version gate, uploads to the CAS, and POSTs the
-# result to bioc-registry's /publish route. A rejection is recorded as an
-# attempt (never silently dropped) and the sweep moves on to the next package
-# — one rejection must never abort the rest.
+# Sweeps completed runs on seandavi/bioc-build@main (a matrix run of
+# dispatch.yml holds one staged-<pkg>-<stream> artifact per package/stream, all
+# sharing that run's run_id, since it calls build.yml via `uses:` rather than
+# dispatching it separately) and, by artifact NAME first — no bytes — figures
+# out which ones are not yet in state/bioc-build/attempts.json at this exact
+# run_id. Only those get downloaded, one `gh run download -n` per artifact:
+# these can be multi-GB data packages, so a name-only precheck before pulling
+# bytes matters. Each downloaded artifact is then verified for real (tarball
+# sha256 + gh attestation, the manifest it built against, the version gate),
+# uploaded to the CAS, and POSTed to bioc-registry's /publish route. A
+# rejection is recorded as an attempt (never silently dropped) and the sweep
+# moves on to the next package — one rejection must never abort the rest.
 #
 # After the sweep, every entry in state/bioc-build/published.json is re-POSTed
 # (self-heal): a later r-universe read-modify-write of prop/<u>/index.json can
@@ -57,6 +59,24 @@ fetch_or_empty() {
 }
 
 universe_of_stream() { [[ "$1" == "devel" ]] && echo "bioc" || echo "bioc-release"; }
+
+# staged_artifact_names <run_id> — names only, no bytes: lets the sweep skip a
+# run (or the packages in it already done) without downloading anything.
+staged_artifact_names() {
+  gh api "repos/$BUILD_REPO/actions/runs/$1/artifacts" --jq '.artifacts[].name' 2>/dev/null \
+    | grep '^staged-' || true
+}
+
+# package_of/stream_of <artifact name> — "staged-<package>-<stream>" splits
+# unambiguously because a package name is never allowed to contain "-".
+package_of() { local n="${1#staged-}"; echo "${n%-*}"; }
+stream_of() { echo "${1##*-}"; }
+
+# already_recorded <package> <stream> <run_id> <attempts_file>
+already_recorded() {
+  jq -e --arg p "$1" --arg s "$2" --arg rid "$3" \
+    '(.[$p][$s].run_id // "") == $rid' "$4" >/dev/null 2>&1
+}
 
 # manifest_get <pkg> <manifest_commit> <key> — one value out of the flat
 # packages/<pkg>.yaml at that commit (a 30-line parser only needs grep).
@@ -180,8 +200,10 @@ process_artifact() {
   local idxfile="$idx_bioc"
   [[ "$universe" == "bioc-release" ]] && idxfile="$idx_release"
 
-  if jq -e --arg p "$pkg" --arg s "$stream" --arg rid "$run_id" \
-    '(.[$p][$s].run_id // "") == $rid' "$attempts_file" >/dev/null 2>&1; then
+  # Authoritative check (staged.json is truth; the artifact name used for the
+  # pre-download precheck in main() is only a hint) — repeated here in case
+  # staged.json's own package/stream disagree with the artifact's name.
+  if already_recorded "$pkg" "$stream" "$run_id" "$attempts_file"; then
     log "$pkg/$stream (run $run_id): already recorded for this run, skipping"
     return 0
   fi
@@ -265,27 +287,42 @@ main() {
   fetch_or_empty "prop/bioc/index.json" > "$idx_bioc"
   fetch_or_empty "prop/bioc-release/index.json" > "$idx_release"
 
-  # ponytail: no pre-download skip at the run level — a fully-processed run
-  # still gets `gh run download` retried every sweep until it ages out of the
-  # last-100 list. Correct (process_artifact's per-artifact check is what
-  # matters) but not free; upgrade path if this gets expensive is a
-  # `gh api .../artifacts` name-only precheck before downloading bytes.
   local n=0
   while read -r run; do
-    local rid run_url workflow
+    local rid run_url workflow names todo
     rid=$(jq -r '.databaseId' <<<"$run")
     run_url=$(jq -r '.url' <<<"$run")
     workflow=$(jq -r '.workflowName' <<<"$run")
-    local rundir="$WORK/run-$rid"
-    mkdir -p "$rundir"
-    if ! gh run download "$rid" -R "$BUILD_REPO" -p 'staged-*' -D "$rundir" >/dev/null 2>&1; then
-      log "run $rid ($workflow): no staged-* artifact — nothing to publish from it"
-      continue
-    fi
+
+    names=$(staged_artifact_names "$rid")
+    [[ -z "$names" ]] && { log "run $rid ($workflow): no staged-* artifact"; continue; }
+    # Name-only precheck: skip the run entirely (no download at all) when
+    # every staged-* artifact it holds is already recorded at this run_id —
+    # a data package's tarball can be gigabytes, and re-downloading one every
+    # 30-minute sweep for weeks until the run ages out of the last-100 list
+    # is not a tolerable cost. process_artifact's own check stays the
+    # authoritative one; this is only to avoid the bytes.
+    todo=()
+    while read -r name; do
+      already_recorded "$(package_of "$name")" "$(stream_of "$name")" "$rid" "$attempts_file" || todo+=("$name")
+    done <<<"$names"
+    [[ ${#todo[@]} -eq 0 ]] && { log "run $rid: all staged-* artifacts already recorded, skipping"; continue; }
+
+    # One `gh run download -n` call per artifact, each into its own directory
+    # — not one call with several -n flags, which extracts flat (no
+    # per-artifact subdirectory) rather than into subdirectories when it
+    # resolves to exactly one artifact. Naming the directory ourselves avoids
+    # depending on that resolution-count-dependent behavior at all.
     n=$((n + 1))
-    while read -r adir; do
-      process_artifact "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file"
-    done < <(find "$rundir" -mindepth 1 -maxdepth 1 -type d)
+    for name in "${todo[@]}"; do
+      local adir="$WORK/run-$rid/$name"
+      mkdir -p "$adir"
+      if gh run download "$rid" -R "$BUILD_REPO" -n "$name" -D "$adir" >/dev/null 2>&1; then
+        process_artifact "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file"
+      else
+        log "run $rid: download failed for artifact $name"
+      fi
+    done
   done < <(jq -c '.[]' "$runs_file")
   log "sweep done ($n run(s) with staged-* artifacts considered)"
 
