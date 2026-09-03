@@ -59,7 +59,8 @@ jobs:
             sysdep_hogs <- c("Rhtslib", "Rhdf5lib", "rhdf5", "rhdf5filters",
                              "igraph", "Rglpk", "glpkAPI", "rgl", "magick",
                              "sf", "terra", "units", "rjags", "Rmpfr",
-                             "gsl", "RcppGSL", "RCurl", "XML")
+                             "gsl", "RcppGSL", "RCurl", "XML",
+                             "DirichletMultinomial")  # needs libgsl-dev (gsl-config)
             candidates <- setdiff(intersect(names(idx), rownames(db)), sysdep_hogs)
             closure <- tools::package_dependencies(candidates, db,
               which = c("Depends", "Imports", "LinkingTo"), recursive = TRUE)
@@ -87,5 +88,54 @@ jobs:
           { echo "## Random-sample install: ${{ matrix.universe }}"
             echo '```'
             grep -E '^eligible:|^sampled:|^sample-result:|^Error|non-zero exit' sample.log || tail -3 sample.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install every bioc-build entry and verify its attestation
+        # Issue #15 (install acceptance). Unlike the random sample above, this
+        # isn't a spot-check: it is every origin=="bioc-build" entry in this
+        # universe's index, so a regression in that whole ingest path (not
+        # just the one package the sample happened to pick) always shows up
+        # here. Kept as its own step (not folded into the sample step above)
+        # so a failure here is a distinct red check in the run, separate from
+        # the unrelated-to-bioc-build sample.
+        env:
+          GH_TOKEN: ${{ github.token }}  # gh attestation verify needs it even for a public repo
+        run: |
+          set -o pipefail
+          {
+            Rscript -e '
+              install.packages("jsonlite")
+              idx <- jsonlite::fromJSON(sprintf(
+                "https://bioc-registry.seandavi.workers.dev/data/prop/%s/index.json",
+                "${{ matrix.universe }}"), simplifyVector = FALSE)
+              bb <- Filter(function(e) identical(e$origin, "bioc-build"), idx)
+              cat("bioc-build entries:", length(bb), "\n")
+              if (!length(bb)) quit(save = "no", status = 0)
+              repos <- c(BIOC = Sys.getenv("REPO_URL"), getOption("repos"))
+              pkgs <- names(bb)
+              install.packages(pkgs, repos = repos)
+              invisible(lapply(pkgs, loadNamespace))
+              cat("bioc-build-result: all", length(pkgs), "loaded\n")
+              # One file per package, for the shell loop below to verify.
+              src <- function(e) Filter(function(a) identical(a$os, "src"), e$artifacts)[[1]]$file
+              writeLines(vapply(bb, src, character(1)), "bioc-build-files.txt")
+            '
+            if [ -s bioc-build-files.txt ]; then
+              while read -r file; do
+                curl -fsSL -o "$file" "$REPO_URL/src/contrib/$file"
+                echo "verifying attestation: $file"
+                gh attestation verify "$file" --repo seandavi/bioc-build
+              done < bioc-build-files.txt
+            fi
+          } 2>&1 | tee bioc-build.log
+
+      - name: bioc-build result into the run summary
+        if: always()
+        run: |
+          [ -f bioc-build.log ] || exit 0
+          { echo "## bioc-build entries install + attestation: ${{ matrix.universe }}"
+            echo '```'
+            grep -E '^bioc-build entries:|^bioc-build-result:|^verifying attestation:|^Error|non-zero exit|sha256 digest|FAIL' bioc-build.log || tail -5 bioc-build.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
