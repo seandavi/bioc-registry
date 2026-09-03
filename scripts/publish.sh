@@ -3,13 +3,16 @@ set -euo pipefail
 
 # scripts/publish.sh — the bioc-build publisher (issue #13, SPEC-014 "publish.yml").
 #
-# Sweeps completed build.yml runs on seandavi/bioc-build. For each one not
-# already recorded in state/bioc-build/attempts.json: downloads its staged-*
-# artifact(s), verifies the tarball (sha256 + gh attestation) and the manifest
-# it built against, applies the version gate, uploads to the CAS, and POSTs the
-# result to bioc-registry's /publish route. A run that fails any check is
-# recorded as an attempt (never silently dropped) and the sweep moves on to the
-# next package — one rejection must never abort the rest.
+# Sweeps completed runs on seandavi/bioc-build@main and downloads every
+# staged-* artifact they hold (a matrix run of dispatch.yml holds one per
+# package/stream, all sharing that run's run_id, since it calls build.yml via
+# `uses:` rather than dispatching it separately). For each staged-<pkg>-<stream>
+# artifact not already recorded in state/bioc-build/attempts.json AT THIS EXACT
+# run_id: verifies the tarball (sha256 + gh attestation) and the manifest it
+# built against, applies the version gate, uploads to the CAS, and POSTs the
+# result to bioc-registry's /publish route. A rejection is recorded as an
+# attempt (never silently dropped) and the sweep moves on to the next package
+# — one rejection must never abort the rest.
 #
 # After the sweep, every entry in state/bioc-build/published.json is re-POSTed
 # (self-heal): a later r-universe read-modify-write of prop/<u>/index.json can
@@ -66,7 +69,11 @@ manifest_get() {
 # publish.test.sh can run the exact same transform against a fixture.
 build_entry() {
   local staged_file="$1" sha256="$2" ts="$3"
-  jq -n --slurpfile s "$staged_file" --arg sha256 "$sha256" --arg ts "$ts" '
+  # TZ=UTC: jq's fromdateiso8601 (below) mis-converts a "Z" timestamp by the
+  # local zone's DST offset on some jq 1.6 builds unless the process is
+  # already in UTC — verified wrong by up to 1h in MDT. GH runners default to
+  # UTC, but --dry-run is meant to run locally too, so pin it explicitly.
+  TZ=UTC jq -n --slurpfile s "$staged_file" --arg sha256 "$sha256" --arg ts "$ts" '
     ($s[0]) as $staged |
     {
       version: $staged.version,
@@ -84,11 +91,16 @@ build_entry() {
       # null description/meta fields (staged.json marks an absent field null,
       # not omitted) must not reach the index — Desc/Meta are string-only.
       desc: ($staged.description | with_entries(select(.value != null))),
+      # Meta.commit.time is a Unix timestamp (repo.ts), matching every other
+      # producer (r-universe _commit.time); staged.json source.commit_time is
+      # ISO 8601 (git log -1 --format=%cI), so it is converted here. Omitted
+      # entirely when build.yml has not started recording commit_time yet.
       meta: (($staged.meta // {} | with_entries(select(.value != null)))
-             + { commit: { id: $staged.source.commit }, git_url: $staged.source.git_url })
-      # ponytail: no commit.time — staged.json only carries the commit id, not
-      # its timestamp. Meta.commit.time is optional, so this is a valid, just
-      # incomplete, record. Add it if build.yml starts recording commit time.
+             + { commit: ({ id: $staged.source.commit } +
+                          (if $staged.source.commit_time then
+                             { time: ($staged.source.commit_time | fromdateiso8601) }
+                           else {} end)),
+                 git_url: $staged.source.git_url })
     }'
 }
 
@@ -145,11 +157,16 @@ publish_ok() {
   jq --arg p "$pkg" --argjson e "$entry" '.[$p] = $e' "$idxfile" > "$idxfile.tmp" && mv "$idxfile.tmp" "$idxfile"
 }
 
-# process_artifact <run_id> <run_url> <artifact_dir> <index-bioc file> <index-bioc-release file>
+# process_artifact <run_id> <run_url> <artifact_dir> <index-bioc file> <index-bioc-release file> <attempts_file>
 # One staged-<package>-<stream> artifact: validate → verify → gate → publish or
 # reject. Never propagates a failure past this one package.
+#
+# A single matrix run of dispatch.yml holds MANY staged-* artifacts sharing one
+# run_id, so "already processed" cannot be decided at the run level (that would
+# skip every package after the first) — it is checked here, per package/stream,
+# against the exact run_id.
 process_artifact() {
-  local run_id="$1" run_url="$2" adir="$3" idx_bioc="$4" idx_release="$5"
+  local run_id="$1" run_url="$2" adir="$3" idx_bioc="$4" idx_release="$5" attempts_file="$6"
   local staged="$adir/staged.json"
   [[ -f "$staged" ]] || { log "run $run_id: $adir has no staged.json, skipping"; return 0; }
 
@@ -162,6 +179,12 @@ process_artifact() {
   manifest_commit=$(jq -r '.manifest_commit' "$staged")
   local idxfile="$idx_bioc"
   [[ "$universe" == "bioc-release" ]] && idxfile="$idx_release"
+
+  if jq -e --arg p "$pkg" --arg s "$stream" --arg rid "$run_id" \
+    '(.[$p][$s].run_id // "") == $rid' "$attempts_file" >/dev/null 2>&1; then
+    log "$pkg/$stream (run $run_id): already recorded for this run, skipping"
+    return 0
+  fi
 
   if [[ "$status" == failed:* ]]; then
     log "$pkg/$stream (run $run_id): $status — recording attempt only"
@@ -223,12 +246,17 @@ main() {
   log "fetching attempts.json"
   local attempts_file="$WORK/attempts.json"
   fetch_or_empty "state/bioc-build/attempts.json" > "$attempts_file"
-  already_attempted() { jq -e --arg rid "$1" 'any(.[]; any(.[]; .run_id == $rid))' "$attempts_file" >/dev/null 2>&1; }
 
-  log "listing completed build.yml runs on $BUILD_REPO@main"
+  # No --workflow filter: dispatch.yml calls build.yml via `uses:` inside a
+  # matrix job, so a matrix-produced staged-* artifact hangs off DISPATCH.yml's
+  # run, not a separate build.yml run — filtering by workflow name here would
+  # silently see none of them. selftest.yml never uploads staged-*, so it drops
+  # out on its own once we try (and fail) to download a staged-* artifact from
+  # it below; no workflow-name filtering needed to exclude it either.
+  log "listing completed runs on $BUILD_REPO@main"
   local runs_file="$WORK/runs.json"
-  gh run list -R "$BUILD_REPO" --workflow build.yml --branch main --status completed \
-    --limit 100 --json databaseId,url,conclusion > "$runs_file"
+  gh run list -R "$BUILD_REPO" --branch main --status completed \
+    --limit 100 --json databaseId,url,conclusion,workflowName > "$runs_file"
 
   # One index.json per universe, cached for the whole sweep and updated in
   # place as packages publish (see publish_ok) so the version gate sees a
@@ -237,24 +265,29 @@ main() {
   fetch_or_empty "prop/bioc/index.json" > "$idx_bioc"
   fetch_or_empty "prop/bioc-release/index.json" > "$idx_release"
 
+  # ponytail: no pre-download skip at the run level — a fully-processed run
+  # still gets `gh run download` retried every sweep until it ages out of the
+  # last-100 list. Correct (process_artifact's per-artifact check is what
+  # matters) but not free; upgrade path if this gets expensive is a
+  # `gh api .../artifacts` name-only precheck before downloading bytes.
   local n=0
   while read -r run; do
-    local rid run_url
+    local rid run_url workflow
     rid=$(jq -r '.databaseId' <<<"$run")
     run_url=$(jq -r '.url' <<<"$run")
-    already_attempted "$rid" && continue
-    n=$((n + 1))
+    workflow=$(jq -r '.workflowName' <<<"$run")
     local rundir="$WORK/run-$rid"
     mkdir -p "$rundir"
     if ! gh run download "$rid" -R "$BUILD_REPO" -p 'staged-*' -D "$rundir" >/dev/null 2>&1; then
-      log "run $rid: no staged-* artifact — nothing to publish from it"
+      log "run $rid ($workflow): no staged-* artifact — nothing to publish from it"
       continue
     fi
+    n=$((n + 1))
     while read -r adir; do
-      process_artifact "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release"
+      process_artifact "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file"
     done < <(find "$rundir" -mindepth 1 -maxdepth 1 -type d)
   done < <(jq -c '.[]' "$runs_file")
-  log "sweep done ($n new run(s) considered)"
+  log "sweep done ($n run(s) with staged-* artifacts considered)"
 
   log "self-heal: re-POSTing state/bioc-build/published.json"
   local published_file="$WORK/published.json"

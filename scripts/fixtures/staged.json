@@ -12,7 +12,8 @@
   "source": {
     "git_url": "https://git.bioconductor.org/packages/msdata",
     "branch": "RELEASE_3_23",
-    "commit": "deadbeefcafef00d"
+    "commit": "deadbeefcafef00d",
+    "commit_time": "2026-08-09T00:12:34Z"
   },
   "manifest_commit": "abc123def456",
   "policy_version": "2026.09.1",
@@ -23,7 +24,10 @@
     "container": "bioconductor/bioconductor_docker:RELEASE_3_23@sha256:deadbeef",
     "r_version": "4.6.1"
   },
-  "check": { "status": "ok", "bioccheck": "ok" },
+  "check": {
+    "status": "ok",
+    "bioccheck": "ok"
+  },
   "description": {
     "Depends": "R (>= 4.1.0)",
     "Imports": null,
