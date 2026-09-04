@@ -109,13 +109,19 @@ else
   echo "$OUT" >&2
   exit 1
 fi
-OUT=$(DRY_RUN=1 process_artifact "222" "https://example/run/222" "$ADIR" "$ATT" 2>&1 || true)
+OUT=$(DRY_RUN=1 process_artifact "1222" "https://example/run/1222" "$ADIR" "$ATT" 2>&1 || true)
 if grep -q "already recorded" <<<"$OUT"; then
-  echo "not ok - process_artifact should NOT skip msdata/release at a different run_id (222)" >&2
+  echo "not ok - process_artifact should NOT skip msdata/release at a NEWER run_id (1222)" >&2
   echo "$OUT" >&2
   exit 1
 else
-  echo "ok - process_artifact does not skip a different run_id for the same package/stream"
+  echo "ok - process_artifact does not skip a newer run_id for the same package/stream"
+OUT=$(DRY_RUN=1 process_artifact "555" "https://example/run/555" "$ADIR" "$ATT" 2>&1)
+if grep -q "already recorded" <<<"$OUT"; then
+  echo "ok - process_artifact skips an OLDER run_id (555 < recorded 999)"
+else
+  echo "not ok - process_artifact should have skipped older run_id 555" >&2; exit 1
+fi
 fi
 rm -rf "$ATT" "$ADIR"
 
@@ -134,8 +140,8 @@ ATT=$(mktemp)
 echo '{"msdata": {"release": {"run_id": "999"}}}' > "$ATT"
 already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "999" "$ATT" \
   || { echo "not ok - already_recorded should match by parsed name at the same run_id" >&2; exit 1; }
-already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "222" "$ATT" \
-  && { echo "not ok - already_recorded should not match a different run_id" >&2; exit 1; }
+already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "1222" "$ATT" \
+  && { echo "not ok - already_recorded should not match a newer run_id" >&2; exit 1; }
 rm -f "$ATT"
 echo "ok - already_recorded via parsed artifact name (precheck path)"
 
