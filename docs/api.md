@@ -350,9 +350,21 @@ Body:
 }
 ```
 
-`entry` is omitted for a failed build or a build the publisher's own checks
-reject (version gate, manifest state, attestation) — `attempt.status` then reads
-`failed:<stage>` or `rejected:<check>` and only the attempts record is written.
+`staged` is `staged.json` verbatim (SPEC-014) and is required with `entry` for a
+new publication: the route runs the consolidated gate over it (see
+[`POST /gate`](#post-gate) — the same function r-universe builds pass through),
+with `replace_seed: true` and the gating R taken from `staged.build.r_version`
+(the policy chose the image, so its R is the gating R for this producer). A
+failing gate writes `attempt.status = rejected:<rule>` and answers
+`{"ok": true, "propagate": false, "decision": {...}}` without touching the
+index. An `entry` without `staged` is accepted only as a byte-identical re-POST
+of the record already in `state/bioc-build/published.json` (`publish.yml`'s
+self-heal) — anything else is a 400, so the self-heal shape cannot bypass the
+gate.
+
+`entry` is omitted for a failed build or an integrity rejection by the publisher
+(`rejected:no-tarball`, `rejected:sha256-mismatch`, `rejected:attestation`) —
+then only the attempts record is written.
 
 400 with `{"error": "<reason>"}` on a malformed body (bad universe, bad package
 name, `entry.sha256` not 64 hex chars, `entry.artifacts[0]` not a `src` artifact,
@@ -369,13 +381,78 @@ and writes it back only if the entry actually changed. Also merges
 `state/bioc-build/attempts.json` and, when `entry` is present,
 `state/bioc-build/published.json` (see [Storage keys](#storage-keys) below).
 
-Responds `{"ok": true, "changed": true|false, "log_key": "…" }` — `changed` is
+Responds `{"ok": true, "propagate": true|false, "changed": true|false, "log_key": "…", "decision": {…} }` — `changed` is
 `false` when the index already held byte-identical content, which is what makes
 `publish.yml`'s self-heal re-POST of every `published.json` entry a no-op most
 of the time: a later r-universe read-modify-write of the same
 `prop/{universe}/index.json` can clobber this route's write, and the cron
 notices and repairs it on its next run rather than the route trying to hold a
 lock across two producers.
+
+### `POST /gate`
+
+Read-only, unauthenticated, CORS-open. The propagation decision — the one
+function `evaluate()` applies to every r-universe wave and `POST /publish`
+applies to every bioc-build candidate (bioc-infrastructure ADR 0011) — run
+against the live `prop/{universe}/index.json`, writing nothing. Ask it "would
+this propagate, and if not why".
+
+Body:
+
+```json
+{
+  "universe": "bioc-release",
+  "candidates": [{
+    "package": "msdata", "version": "0.52.0", "origin": "bioc-build",
+    "build_status": "success",
+    "jobs": [{ "config": "linux-x86_64", "r": "4.6.1", "check": "OK" },
+             { "config": "bioc-checks", "check": "ERROR" }],
+    "desc": { "Depends": "R (>= 3.5.0)", "Suggests": "xcms, mzR, MSnbase" },
+    "manifest": { "state": "active", "git_url": "https://git.bioconductor.org/packages/msdata",
+                  "streams": ["release", "devel"], "component": "data-experiment", "profile": "data-experiment" },
+    "source_git_url": "https://git.bioconductor.org/packages/msdata", "stream": "release"
+  }],
+  "config": { "gating_r": "4.6", "bioccheck": "advisory", "replace_seed": true }
+}
+```
+
+`origin`, `build_status` and `desc` default to `r-universe`, `success` and `{}`.
+`manifest` is optional: absent, the manifest rules do not run (r-universe);
+`null` means "lookup failed". `config` is optional; `gating_r` defaults to the
+R line bioconductor.org's `config.yaml` maps the universe to, `bioccheck` to
+`advisory`, `replace_seed` to `false`. Up to 500 candidates; the `deps` rule is a
+fixpoint over the whole set, so a coordinated bump can be asked about together.
+
+Response:
+
+```json
+{
+  "config": { "gating_r": "4.6", "bioccheck": "advisory", "replace_seed": true },
+  "decisions": {
+    "msdata": {
+      "propagate": true, "archs": ["linux"],
+      "reasons": [
+        { "rule": "build-status", "ok": true, "detail": "success" },
+        { "rule": "families", "ok": true, "detail": "linux" },
+        { "rule": "bioccheck", "ok": true, "detail": "ERROR (advisory)" },
+        { "rule": "version-parse", "ok": true, "detail": "0.52.0" },
+        { "rule": "version-gate", "ok": true, "detail": "0.52.0 > 0.51.1" },
+        { "rule": "manifest-state", "ok": true, "detail": "active" },
+        { "rule": "manifest-git-url", "ok": true, "detail": "…" },
+        { "rule": "manifest-stream", "ok": true, "detail": "release in [release, devel]" },
+        { "rule": "manifest-component", "ok": true, "detail": "data-experiment / data-experiment" },
+        { "rule": "deps", "ok": true }
+      ]
+    }
+  },
+  "approved": ["msdata"]
+}
+```
+
+Every rule reports, pass or fail. `approved` is the propagating subset in
+dependency order. `attempts.json` statuses use the same names:
+`rejected:<rule>`. 400 with `{"error": "…"}` on a bad universe or malformed
+candidates.
 
 ## Storage keys
 

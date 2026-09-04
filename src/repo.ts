@@ -87,9 +87,19 @@ export type PublishEntry = {
   desc: Desc; meta?: Meta; origin: "bioc-build";
 };
 export type PublishAttempt = { commit: string; status: string; run_url?: string; ts?: string };
+// The build details the gate needs, straight out of staged.json (SPEC-014).
+export type PublishStaged = {
+  status: string; stream: string; manifest_commit: string | null;
+  source: { git_url: string | null }; build: { r_version: string | null };
+  check: { status: string | null; bioccheck: string | null };
+};
 export type PublishBody = {
   universe: string; package: string; run_id: string;
   attempt: PublishAttempt; entry?: PublishEntry;
+  // Required with `entry` for a NEW publication: the route gates on it. The one
+  // exception is publish.yml's self-heal re-POST of an already-accepted entry,
+  // which carries no staged and must match published.json byte for byte.
+  staged?: PublishStaged;
 };
 
 const PKG_NAME_RE = /^[A-Za-z][A-Za-z0-9.]*$/;
@@ -120,6 +130,13 @@ export function validatePublish(
     if (!e.desc || typeof e.desc !== "object" || !Object.keys(e.desc).length)
       return { ok: false, reason: "entry.desc must be non-empty" };
     if (e.origin !== "bioc-build") return { ok: false, reason: "entry.origin must be bioc-build" };
+  }
+  if (b.staged !== undefined) {
+    const st = b.staged as Partial<PublishStaged> | null;
+    if (!st || typeof st !== "object" || typeof st.status !== "string" || typeof st.stream !== "string"
+        || !st.source || typeof st.source !== "object" || !st.build || typeof st.build !== "object"
+        || !st.check || typeof st.check !== "object")
+      return { ok: false, reason: "invalid staged" };
   }
   return { ok: true, value: b as PublishBody };
 }
@@ -566,6 +583,108 @@ export function approveByDeps<T extends { package: string; version: string; desc
     }),
   };
 }
+
+// ---------- the consolidated gate (bioc-infrastructure ADR 0011) ----------
+// One decision function for both producers. evaluate() hands it a whole
+// r-universe wave; POST /publish hands it one bioc-build candidate; POST /gate
+// hands it whatever the caller wants to ask about. Every rule reports, pass or
+// fail, so "why did X not propagate" is answered by one record instead of by
+// re-deriving from three places. Integrity (sha256, attestation) is NOT a gate
+// rule: that is the producer proving the bytes are theirs, checked where the
+// bytes are.
+export type GateManifest = {
+  state?: string; git_url?: string; streams?: string[]; component?: string; profile?: string;
+};
+export type GateInput = {
+  package: string; version: string; origin: Origin;
+  build_status: string;   // "success", or whatever the producer says went wrong
+  jobs: GateJob[];        // per-config check verdicts; bioc-checks rides along
+  desc: Desc;
+  // undefined: not subject to manifest rules (r-universe). null: lookup failed.
+  // object: the package's manifest facts at the commit the build recorded.
+  manifest?: GateManifest | null;
+  source_git_url?: string; stream?: string;
+};
+export type GateConfig = {
+  gating_r: string;                    // R minor the gating jobs must run on
+  bioccheck: "advisory" | "blocking";
+  // bioc-build may replace a bioconductor-seeded entry at the same version
+  // (SPEC-014: a seed is not a verdict, our build of it is). r-universe never
+  // re-publishes a version, so a seed there waits for a real bump.
+  replace_seed: boolean;
+};
+export type Reason = { rule: string; ok: boolean; detail?: string };
+export type Decision = { propagate: boolean; archs: Family[]; reasons: Reason[] };
+
+export const R_VER = /^\d+([.-]\d+)*$/;
+
+export function gate(
+  inputs: GateInput[], config: GateConfig, idx: PropIndex
+): { decisions: Record<string, Decision>; approved: string[] } {
+  const decisions: Record<string, Decision> = {};
+  const clear: { package: string; version: string; desc: Desc }[] = [];
+  for (const c of inputs) {
+    const reasons: Reason[] = [];
+    const rule = (name: string, ok: boolean, detail?: string) =>
+      reasons.push(detail === undefined ? { rule: name, ok } : { rule: name, ok, detail });
+    rule("build-status", c.build_status === "success", c.build_status);
+    const archs = passingFamilies(c.jobs, config.gating_r);
+    rule("families", archs.length > 0, archs.length ? archs.join(",") : `no family passed on R ${config.gating_r}`);
+    const bc = c.jobs.find((j) => j.config === "bioc-checks")?.check;
+    rule("bioccheck", config.bioccheck === "advisory" || !GATE_BAD.has(bc ?? ""), `${bc ?? "not run"} (${config.bioccheck})`);
+    rule("version-parse", R_VER.test(c.version), c.version);
+    const prev = idx[c.package];
+    const prevOrigin = prev?.origin ?? "r-universe";
+    if (!prev) rule("version-gate", true, `${c.version}, first publication`);
+    else if (verGt(c.version, prev.version)) rule("version-gate", true, `${c.version} > ${prev.version}`);
+    else if (config.replace_seed && c.version === prev.version && prevOrigin === "bioconductor")
+      rule("version-gate", true, `${c.version} replaces the bioconductor seed`);
+    else rule("version-gate", false, `${c.version} is not > ${prev.version} (${prevOrigin})`);
+    if (c.manifest !== undefined) {
+      const m = c.manifest;
+      if (!m) rule("manifest", false, "manifest lookup failed");
+      else {
+        rule("manifest-state", m.state === "active", m.state ?? "not in manifest");
+        rule("manifest-git-url", !!m.git_url && m.git_url === c.source_git_url, `${m.git_url ?? "none"} vs built ${c.source_git_url ?? "none"}`);
+        rule("manifest-stream", !!c.stream && (m.streams ?? []).includes(c.stream), `${c.stream ?? "none"} in [${(m.streams ?? []).join(", ")}]`);
+        rule("manifest-component", !!m.component && m.component === m.profile, `${m.component ?? "none"} / ${m.profile ?? "none"}`);
+      }
+    }
+    const propagate = reasons.every((x) => x.ok);
+    decisions[c.package] = { propagate, archs, reasons };
+    if (propagate) clear.push({ package: c.package, version: c.version, desc: c.desc });
+  }
+  // The dependency rule is a fixpoint over the wave, so it runs last and only
+  // over candidates every other rule cleared.
+  const { approved, blocked } = approveByDeps(clear, idx);
+  for (const p of approved) decisions[p.package].reasons.push({ rule: "deps", ok: true });
+  for (const b of blocked) {
+    const d = decisions[b.package];
+    d.propagate = false;
+    d.reasons.push({ rule: "deps", ok: false, detail: `needs ${b.needs}` });
+  }
+  return { decisions, approved: approved.map((p) => p.package) };
+}
+
+// bioc-build's one linux job, in the shape r-universe jobs already have, so the
+// same families rule reads both. check.status is ok|warning|error (SPEC-014).
+export function gateInputFromStaged(
+  pkg: string, entry: PublishEntry, st: PublishStaged, manifest: GateManifest | null
+): GateInput {
+  const jobs: GateJob[] = [
+    { config: "linux-x86_64", r: st.build.r_version ?? "", check: (st.check.status ?? "").toUpperCase() },
+  ];
+  if (st.check.bioccheck) jobs.push({ config: "bioc-checks", check: st.check.bioccheck.toUpperCase() });
+  return {
+    package: pkg, version: entry.version, origin: "bioc-build",
+    build_status: st.status.startsWith("failed") ? st.status : "success",
+    jobs, desc: entry.desc, manifest,
+    source_git_url: st.source.git_url ?? undefined, stream: st.stream,
+  };
+}
+
+// The first failed rule, for attempts.json's rejected:<rule> vocabulary.
+export const rejectedRule = (d: Decision) => d.reasons.find((r) => !r.ok)?.rule ?? "unknown";
 
 // CRAN renamed the macOS arm64 directory at R 4.6 (big-sur-arm64 -> sonoma-arm64)
 // and Bioconductor followed; verified 2026-08-14, big-sur-arm64/4.6 is a 404 on

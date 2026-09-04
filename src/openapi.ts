@@ -136,6 +136,71 @@ export const OPENAPI = {
         responses: { 200: { description: "Tgz archive." }, 404: notFound },
       },
     },
+    "/gate": {
+      post: {
+        tags: ["repo"],
+        summary: "Would this propagate, and why not?",
+        description:
+          "The propagation decision — the same function applied to every r-universe wave and " +
+          "every bioc-build publish — run read-only against the live index. Every rule reports " +
+          "pass or fail: build-status, families, bioccheck, version-parse, version-gate, the " +
+          "manifest rules (when a manifest block is given) and deps (a fixpoint over all " +
+          "candidates). See docs/api.md for the full body.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["universe", "candidates"],
+                properties: {
+                  universe: { type: "string", enum: ["bioc", "bioc-release"] },
+                  candidates: {
+                    type: "array", maxItems: 500,
+                    items: {
+                      type: "object", required: ["package", "version", "jobs"],
+                      properties: {
+                        package: { type: "string" }, version: { type: "string" },
+                        origin: { type: "string", enum: ["r-universe", "bioconductor", "bioc-build"] },
+                        build_status: { type: "string" },
+                        jobs: { type: "array", items: { type: "object", properties: { config: { type: "string" }, r: { type: "string" }, check: { type: "string" } } } },
+                        desc: { type: "object" }, manifest: { type: "object", nullable: true },
+                        source_git_url: { type: "string" }, stream: { type: "string" },
+                      },
+                    },
+                  },
+                  config: {
+                    type: "object",
+                    properties: {
+                      gating_r: { type: "string" }, bioccheck: { type: "string", enum: ["advisory", "blocking"] },
+                      replace_seed: { type: "boolean" },
+                    },
+                  },
+                },
+              },
+              example: {
+                universe: "bioc-release",
+                candidates: [{ package: "msdata", version: "0.52.0", jobs: [{ config: "linux-x86_64", r: "4.6.1", check: "OK" }] }],
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: "Per-candidate decision with every rule's verdict, and the approved subset in dependency order.",
+            content: { "application/json": { schema: { type: "object", properties: {
+              config: { type: "object" },
+              decisions: { type: "object", additionalProperties: { type: "object", properties: {
+                propagate: { type: "boolean" }, archs: { type: "array", items: { type: "string" } },
+                reasons: { type: "array", items: { type: "object", properties: { rule: { type: "string" }, ok: { type: "boolean" }, detail: { type: "string" } } } },
+              } } },
+              approved: { type: "array", items: { type: "string" } },
+            } } } },
+          },
+          400: { description: "Bad universe or malformed candidates." },
+        },
+      },
+    },
     "/manifest.json": {
       get: {
         tags: ["data"],

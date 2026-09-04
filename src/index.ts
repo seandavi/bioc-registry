@@ -3,12 +3,13 @@ import { parquetWriteBuffer } from "hyparquet-writer";
 import { parquetReadObjects } from "hyparquet";
 import {
   Artifact, Desc, Family, Meta, PropIndex, PKG_EXT, SeedArtifact, MAC_X86_DIR,
-  approveByDeps, describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
-  parseGitmodules, parseRepoDir, passingFamilies, pendingArtifacts, pendingJobIds,
+  describe, findArtifact, macArmDir, metaOf, originOf, packagesDcf, parseDcf,
+  parseGitmodules, parseRepoDir, pendingArtifacts, pendingJobIds,
   planCompaction, parseZipCentral, isLogEntry, buildManifest,
   invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
   viewsDcf, writeOnce, JobRow, RowState,
   validatePublish, upsertEntry, mergeAttempt, AttemptRecord,
+  gate, rejectedRule, R_VER, GateConfig, GateInput, GateManifest, gateInputFromStaged,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -518,7 +519,6 @@ async function gatingRMinor(universe: string): Promise<string> {
   return rMinor;
 }
 
-const R_VER = /^\d+([.-]\d+)*$/;
 const BATCH = 20;
 
 type Candidate = {
@@ -537,23 +537,28 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
   if (!obs) throw new Error(`missing observation ${obsKey}`);
   const pkgs = await obs.json<FullPkg[]>();
   const idx = await readIndex(env, universe);
-  const rMinor = await gatingRMinor(universe);
-  const candidates: Candidate[] = [];
+  const config: GateConfig = { gating_r: await gatingRMinor(universe), bioccheck: "advisory", replace_seed: false };
+  const byName = new Map<string, FullPkg>();
+  const inputs: GateInput[] = [];
   for (const p of pkgs) {
-    const jobs = p._jobs ?? [];
-    if (p._status !== "success" || !jobs.length) continue;
-    const archs = passingFamilies(jobs, rMinor);
-    if (!archs.length) continue;
-    if (!p.Version || !R_VER.test(p.Version) || !p._sha256) continue;
-    const prev = idx[p.Package];
-    // Version must be a strict bump over the previously propagated version.
-    if (prev && !verGt(p.Version, prev.version)) continue;
+    // No source tarball means nothing to propagate, whatever the checks say.
+    if (!p.Package || !p.Version || !p._sha256) continue;
+    byName.set(p.Package, p);
+    inputs.push({
+      package: p.Package, version: p.Version, origin: "r-universe",
+      build_status: p._status ?? "", jobs: p._jobs ?? [], desc: describe(p),
+    });
+  }
+  const { decisions, approved } = gate(inputs, config, idx);
+  const candidates: Candidate[] = approved.map((name) => {
+    const p = byName.get(name)!;
+    const archs = decisions[name].archs;
     const artifacts: Artifact[] = [
       // Source always rides with an eligible package; binaries only for the
       // families whose checks passed. wasm has no gating job, so it stays
       // advisory and rides along like before.
       {
-        os: "src", r: "", sha256: p._sha256,
+        os: "src", r: "", sha256: p._sha256!,
         file: p._file || `${p.Package}_${p.Version}.tar.gz`,
       },
       ...(p._binaries ?? [])
@@ -565,31 +570,50 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
           file: `${p.Package}_${p.Version}.${PKG_EXT[b.os] ?? "tar.gz"}`,
         })),
     ];
-    candidates.push({
-      package: p.Package, version: p.Version, sha256: p._sha256,
-      bioccheck: jobs.find((j) => j.config === "bioc-checks")?.check ?? null,
-      artifacts,
-      desc: describe(p),
-      meta: metaOf(p),
-      archs,
-    });
-  }
-  // Build gate passed; now the dependency gate (#34). Blocked candidates are
-  // simply not written to pending — their version is still ahead of what is
-  // published, so they are reconsidered on every later wave and land as soon as
-  // whatever they are waiting on propagates.
-  const { approved, blocked } = approveByDeps(candidates, idx);
+    return {
+      package: p.Package, version: p.Version!, sha256: p._sha256!,
+      bioccheck: (p._jobs ?? []).find((j) => j.config === "bioc-checks")?.check ?? null,
+      artifacts, desc: describe(p), meta: metaOf(p), archs,
+    };
+  });
   const pendingKey = `prop/${universe}/pending/${digest.slice(0, 12)}.json`;
-  await env.ARCHIVE.put(pendingKey, JSON.stringify(approved));
-  // Written next to pending so "why has X not propagated?" is answerable from
-  // the archive rather than by re-deriving it. Only when non-empty: the steady
-  // state is nothing blocked, and an empty file every wave is just noise.
+  await env.ARCHIVE.put(pendingKey, JSON.stringify(candidates));
+  // "Why has X not propagated?" — answered from the archive, not by re-deriving.
+  // Only versions that ARE new (version-gate passed) and still failed: the
+  // steady state is every package sitting at its published version, and
+  // listing all of those every wave is noise, not a record. A blocked candidate
+  // is reconsidered on every later wave and lands as soon as its blocker does.
+  const blocked = Object.entries(decisions)
+    .filter(([, d]) => !d.propagate && d.reasons.some((r) => r.rule === "version-gate" && r.ok))
+    .map(([name, d]) => ({ package: name, version: byName.get(name)!.Version, reasons: d.reasons }));
   if (blocked.length)
     await env.ARCHIVE.put(
       `prop/${universe}/blocked/${digest.slice(0, 12)}.json`,
       JSON.stringify(blocked)
     );
-  return { pendingKey, count: approved.length, blocked: blocked.length };
+  return { pendingKey, count: candidates.length, blocked: blocked.length };
+}
+
+// Manifest facts for the gate, at the commit the build recorded. The file is
+// flat `key: value` YAML (bioc-manifest's validate.py enforces that shape), so
+// a line parser is the whole parser. 404 = not in the manifest at that commit,
+// which is a verdict ({}: fails manifest-state); anything else is a lookup
+// failure (null), recorded as such so it is retried rather than mistaken for
+// "not authorized".
+async function fetchManifest(pkg: string, commit: string | null): Promise<GateManifest | null> {
+  if (!commit || !/^[0-9a-f]{40}$/.test(commit)) return null;
+  const res = await fetch(`https://raw.githubusercontent.com/seandavi/bioc-manifest/${commit}/packages/${pkg}.yaml`);
+  if (res.status === 404) return {};
+  if (!res.ok) return null;
+  const m: Record<string, string> = {};
+  for (const line of (await res.text()).split("\n")) {
+    const mm = line.match(/^([a-z_]+):\s*(.*)$/);
+    if (mm) m[mm[1]] = mm[2].trim().replace(/^"(.*)"$/, "$1");
+  }
+  return {
+    state: m.state, git_url: m.git_url, component: m.component, profile: m.profile,
+    streams: (m.streams ?? "").replace(/^\[|\]$/g, "").split(",").map((x) => x.trim()).filter(Boolean),
+  };
 }
 
 async function copyCas(env: Env, universe: string, sha256: string): Promise<boolean> {
@@ -1469,13 +1493,52 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       try { body = await req.json(); } catch { return json({ error: "invalid JSON body" }, 400); }
       const v = validatePublish(body, UNIVERSES);
       if (!v.ok) return json({ error: v.reason }, 400);
-      const { universe, package: pkg, run_id, attempt, entry } = v.value;
+      const { universe, package: pkg, run_id, attempt, entry, staged } = v.value;
       if (entry && !(await env.ARCHIVE.head(`prop/${universe}/cas/${entry.sha256}`)))
         return json({ error: "cas object missing" }, 409);
+      const stream = universe === "bioc" ? "devel" : "release";
+      const recordAttempt = async (status: string) => {
+        const ts = attempt.ts || new Date().toISOString();
+        const attemptsObj = await env.ARCHIVE.get("state/bioc-build/attempts.json");
+        const attempts: Record<string, Record<string, AttemptRecord>> =
+          attemptsObj ? await attemptsObj.json() : {};
+        attempts[pkg] ??= {};
+        attempts[pkg][stream] = mergeAttempt(attempts[pkg][stream], {
+          commit: attempt.commit, status, run_id, run_url: attempt.run_url ?? "", ts,
+        });
+        await env.ARCHIVE.put("state/bioc-build/attempts.json", JSON.stringify(attempts));
+      };
 
       let changed = false;
       let log_key: string | undefined;
+      let decision: ReturnType<typeof gate>["decisions"][string] | undefined;
       if (entry) {
+        // The gate, applied here and nowhere else on this path (ADR 0011). A
+        // re-POST of an already-accepted entry (publish.yml's self-heal) skips
+        // it — that entry passed when it was accepted — but only if it is
+        // byte-identical to the accepted record, so the self-heal shape cannot
+        // be used to slip an ungated entry in.
+        const publishedObj0 = await env.ARCHIVE.get("state/bioc-build/published.json");
+        const accepted: PropIndex[string] | undefined =
+          publishedObj0 ? (await publishedObj0.json<Record<string, Record<string, PropIndex[string]>>>())[universe]?.[pkg] : undefined;
+        if (staged) {
+          const manifest = await fetchManifest(pkg, staged.manifest_commit);
+          const input = gateInputFromStaged(pkg, entry, staged, manifest);
+          // policy.yaml picks the image, so the R it ships IS the gating R for
+          // this producer (bioc-build#32: drift from bioconductor.org's
+          // r_ver_for_bioc_ver is accepted, not gated on).
+          const config: GateConfig = {
+            gating_r: (staged.build.r_version ?? "").split(".").slice(0, 2).join("."),
+            bioccheck: "advisory", replace_seed: true,
+          };
+          decision = gate([input], config, await readIndex(env, universe)).decisions[pkg];
+          if (!decision.propagate) {
+            await recordAttempt(`rejected:${rejectedRule(decision)}`);
+            return json({ ok: true, propagate: false, changed: false, decision });
+          }
+        } else if (!accepted || JSON.stringify(accepted) !== JSON.stringify({ ...entry, ts: entry.ts })) {
+          return json({ error: "entry without staged must be a re-POST of the accepted published.json record" }, 400);
+        }
         // publish.yml's self-heal re-POSTs every entry in published.json every
         // sweep, so the SAME entry arrives here forever. Its ts must be STABLE
         // across those re-POSTs — entry.ts, as stored — rather than attempt.ts
@@ -1502,18 +1565,35 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
         }
       }
 
-      const stream = universe === "bioc" ? "devel" : "release";
-      const ts = attempt.ts || new Date().toISOString();
-      const attemptsObj = await env.ARCHIVE.get("state/bioc-build/attempts.json");
-      const attempts: Record<string, Record<string, AttemptRecord>> =
-        attemptsObj ? await attemptsObj.json() : {};
-      attempts[pkg] ??= {};
-      attempts[pkg][stream] = mergeAttempt(attempts[pkg][stream], {
-        commit: attempt.commit, status: attempt.status, run_id, run_url: attempt.run_url ?? "", ts,
-      });
-      await env.ARCHIVE.put("state/bioc-build/attempts.json", JSON.stringify(attempts));
-
-      return json({ ok: true, changed, log_key });
+      await recordAttempt(attempt.status);
+      return json({ ok: true, propagate: !!entry, changed, log_key, decision });
+    }
+    if (pathname === "/gate") {
+      // Read-only: the same decision function evaluate() and /publish apply,
+      // against the live index, for anyone asking "would this propagate, and
+      // why not". Nothing is written.
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const json = (obj: unknown, status = 200) =>
+        new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } });
+      type Partial_ = Pick<GateInput, "package" | "version" | "jobs"> & Partial<GateInput>;
+      let body: { universe?: string; candidates?: Partial_[]; config?: Partial<GateConfig> };
+      try { body = await req.json(); } catch { return json({ error: "invalid JSON body" }, 400); }
+      if (!UNIVERSES.includes(body.universe ?? "")) return json({ error: "invalid universe" }, 400);
+      if (!Array.isArray(body.candidates) || !body.candidates.length || body.candidates.length > 500)
+        return json({ error: "candidates must be a non-empty array (max 500)" }, 400);
+      for (const c of body.candidates)
+        if (!c || typeof c.package !== "string" || typeof c.version !== "string" || !Array.isArray(c.jobs))
+          return json({ error: "each candidate needs package, version and jobs[]" }, 400);
+      const config: GateConfig = {
+        gating_r: body.config?.gating_r ?? await gatingRMinor(body.universe!),
+        bioccheck: body.config?.bioccheck ?? "advisory",
+        replace_seed: body.config?.replace_seed ?? false,
+      };
+      const idx = await readIndex(env, body.universe!);
+      const inputs: GateInput[] = body.candidates.map((c) => ({
+        ...c, origin: c.origin ?? "r-universe", build_status: c.build_status ?? "success", desc: c.desc ?? {},
+      }));
+      return json({ config, ...gate(inputs, config, idx) });
     }
     if (pathname.startsWith("/data/")) {
       const key = decodeURIComponent(pathname.slice(6));
