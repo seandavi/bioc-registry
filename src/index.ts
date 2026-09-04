@@ -1565,7 +1565,11 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
         }
       }
 
-      await recordAttempt(attempt.status);
+      // The self-heal re-POST (entry, no staged) restores the index only. It
+      // must not write attempts.json: publish.yml stamps it status "ok" with
+      // whatever run_id attempts.json holds, which clobbered a just-recorded
+      // rejected:<rule> for that same run (seen 2026-09-04, msdata).
+      if (!(entry && !staged)) await recordAttempt(attempt.status);
       return json({ ok: true, propagate: !!entry, changed, log_key, decision });
     }
     if (pathname === "/gate") {
