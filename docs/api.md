@@ -360,7 +360,7 @@ failing gate writes `attempt.status = rejected:<rule>` and answers
 index. An `entry` without `staged` is accepted only as a byte-identical re-POST
 of the record already in `state/bioc-build/published.json` (`publish.yml`'s
 self-heal) — anything else is a 400, so the self-heal shape cannot bypass the
-gate.
+gate. That path restores the index only; it never writes `attempts.json`.
 
 `entry` is omitted for a failed build or an integrity rejection by the publisher
 (`rejected:no-tarball`, `rejected:sha256-mismatch`, `rejected:attestation`) —
