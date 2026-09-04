@@ -92,16 +92,6 @@ else
 fi
 rm -f "$BAD_TIME"
 
-# version_gate_ok: a strict sort -V bump is required unless replacing an
-# origin:bioconductor seed at the same version.
-IDX=$(mktemp)
-echo '{"msdata": {"version": "0.51.0", "origin": "r-universe"}}' > "$IDX"
-version_gate_ok "$IDX" msdata 0.51.1 || { echo "not ok - version_gate_ok should accept a strict bump" >&2; exit 1; }
-version_gate_ok "$IDX" msdata 0.51.0 && { echo "not ok - version_gate_ok should reject a tie against r-universe" >&2; exit 1; }
-echo '{"msdata": {"version": "0.51.1", "origin": "bioconductor"}}' > "$IDX"
-version_gate_ok "$IDX" msdata 0.51.1 || { echo "not ok - version_gate_ok should accept a tie against a bioconductor seed" >&2; exit 1; }
-rm -f "$IDX"
-echo "ok - version_gate_ok"
 
 # process_artifact's idempotence check (issue #12 review): a matrix run's
 # staged-* artifacts share one run_id, so "already processed" is per
@@ -111,7 +101,7 @@ ATT=$(mktemp)
 echo '{"msdata": {"release": {"run_id": "999"}}, "other": {"release": {"run_id": "111"}}}' > "$ATT"
 ADIR=$(mktemp -d)
 cp "$DIR/fixtures/staged.json" "$ADIR/staged.json"   # package msdata, stream release
-OUT=$(DRY_RUN=1 process_artifact "999" "https://example/run/999" "$ADIR" /dev/null /dev/null "$ATT" 2>&1)
+OUT=$(DRY_RUN=1 process_artifact "999" "https://example/run/999" "$ADIR" "$ATT" 2>&1)
 if grep -q "already recorded" <<<"$OUT"; then
   echo "ok - process_artifact skips a package/stream already recorded for THIS run_id"
 else
@@ -119,7 +109,7 @@ else
   echo "$OUT" >&2
   exit 1
 fi
-OUT=$(DRY_RUN=1 process_artifact "222" "https://example/run/222" "$ADIR" /dev/null /dev/null "$ATT" 2>&1 || true)
+OUT=$(DRY_RUN=1 process_artifact "222" "https://example/run/222" "$ADIR" "$ATT" 2>&1 || true)
 if grep -q "already recorded" <<<"$OUT"; then
   echo "not ok - process_artifact should NOT skip msdata/release at a different run_id (222)" >&2
   echo "$OUT" >&2
@@ -161,10 +151,10 @@ cp "$DIR/fixtures/staged.json" "$GOODDIR/staged.json"   # no tarball copied -> r
 ATT2=$(mktemp); echo '{}' > "$ATT2"
 
 BAD_STATUS=0
-DRY_RUN=1 process_artifact_safe "1" "https://example/run/1" "$BADDIR" /dev/null /dev/null "$ATT2" "staged-broken-release" \
+DRY_RUN=1 process_artifact_safe "1" "https://example/run/1" "$BADDIR" "$ATT2" "staged-broken-release" \
   >/dev/null 2>&1 || BAD_STATUS=$?
 GOOD_STATUS=0
-GOOD_OUT=$(DRY_RUN=1 process_artifact_safe "2" "https://example/run/2" "$GOODDIR" /dev/null /dev/null "$ATT2" "staged-msdata-release" 2>&1) \
+GOOD_OUT=$(DRY_RUN=1 process_artifact_safe "2" "https://example/run/2" "$GOODDIR" "$ATT2" "staged-msdata-release" 2>&1) \
   || GOOD_STATUS=$?
 
 if [[ "$BAD_STATUS" -ne 0 ]]; then

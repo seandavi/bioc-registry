@@ -78,15 +78,6 @@ already_recorded() {
     '(.[$p][$s].run_id // "") == $rid' "$4" >/dev/null 2>&1
 }
 
-# manifest_get <pkg> <manifest_commit> <key> — one value out of the flat
-# packages/<pkg>.yaml at that commit (a 30-line parser only needs grep).
-manifest_get() {
-  curl -sf "https://raw.githubusercontent.com/${MANIFEST_REPO}/${2}/packages/${1}.yaml" 2>/dev/null \
-    | grep -E "^${3}:" | head -1 | sed -E "s/^${3}:[[:space:]]*//" | tr -d '"'
-}
-
-# Build the /publish entry JSON from a verified staged.json. One jq filter so
-# publish.test.sh can run the exact same transform against a fixture.
 build_entry() {
   local staged_file="$1" sha256="$2" ts="$3"
   # source.commit_time is `git log -1 --format=%cI` — ISO 8601 WITH a numeric
@@ -125,22 +116,6 @@ build_entry() {
     }'
 }
 
-# version_gate_ok <index.json file> <package> <new version>
-# Reject unless the new version is a strict sort -V bump over the index's
-# current entry, or ties a current entry that is a Bioconductor seed (an
-# origin: bioconductor entry never passed any gate, so matching its version
-# once is a real improvement, not a downgrade).
-version_gate_ok() {
-  local idxfile="$1" pkg="$2" new="$3" cur cur_origin top
-  cur=$(jq -r --arg p "$pkg" '.[$p].version // ""' "$idxfile")
-  [[ -z "$cur" ]] && return 0
-  cur_origin=$(jq -r --arg p "$pkg" '.[$p].origin // "r-universe"' "$idxfile")
-  if [[ "$new" == "$cur" && "$cur_origin" == "bioconductor" ]]; then return 0; fi
-  top=$(printf '%s\n%s\n' "$cur" "$new" | sort -V | tail -1)
-  [[ "$top" == "$new" && "$new" != "$cur" ]]
-}
-
-# record_attempt <universe> <package> <run_id> <commit> <status> <run_url>
 record_attempt() {
   local ts body
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -151,11 +126,12 @@ record_attempt() {
   post_publish "$body" >/dev/null
 }
 
-# publish_ok <universe> <package> <run_id> <commit> <run_url> <staged_json> <sha256> <idxfile>
-# Uploads (unless dry-run), builds the entry, POSTs it, and updates the sweep's
-# own index cache so a later package in this same sweep sees the new version.
+# publish_ok <universe> <package> <run_id> <commit> <run_url> <staged_json> <sha256>
+# Upload (unless dry-run), then POST staged.json alongside the entry: the route applies the gate
+# (version, manifest, deps — bioc-registry ADR 0011) and records the verdict
+# itself; we only log what it decided.
 publish_ok() {
-  local universe="$1" pkg="$2" run_id="$3" commit="$4" run_url="$5" staged="$6" sha256="$7" idxfile="$8"
+  local universe="$1" pkg="$2" run_id="$3" commit="$4" run_url="$5" staged="$6" sha256="$7"
   local adir tarball_file ts entry body
   adir=$(dirname "$staged")
   tarball_file=$(jq -r '.tarball.file' "$staged")
@@ -170,12 +146,14 @@ publish_ok() {
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   entry=$(build_entry "$staged" "$sha256" "$ts")
   body=$(jq -n --arg universe "$universe" --arg package "$pkg" --arg run_id "$run_id" \
-    --argjson entry "$entry" --arg commit "$commit" --arg run_url "$run_url" --arg ts "$ts" \
-    '{universe:$universe, package:$package, run_id:$run_id, entry:$entry,
+    --argjson entry "$entry" --slurpfile staged "$staged" --arg commit "$commit" --arg run_url "$run_url" --arg ts "$ts" \
+    '{universe:$universe, package:$package, run_id:$run_id, entry:$entry, staged:$staged[0],
       attempt:{commit:$commit, status:"ok", run_url:$run_url, ts:$ts}}')
-  log "$pkg ($universe, run $run_id): publishing $(jq -r .version "$staged")"
-  post_publish "$body" >/dev/null
-  jq --arg p "$pkg" --argjson e "$entry" '.[$p] = $e' "$idxfile" > "$idxfile.tmp" && mv "$idxfile.tmp" "$idxfile"
+  log "$pkg ($universe, run $run_id): submitting $(jq -r .version "$staged")"
+  local resp; resp=$(post_publish "$body")
+  if [[ "${DRY_RUN:-0}" != 1 && "$(jq -r '.propagate' <<<"$resp")" != true ]]; then
+    log "$pkg/$universe (run $run_id): gate said no: $(jq -c '[.decision.reasons[] | select(.ok|not)]' <<<"$resp")"
+  fi
 }
 
 # process_artifact <run_id> <run_url> <artifact_dir> <index-bioc file> <index-bioc-release file> <attempts_file>
@@ -187,19 +165,16 @@ publish_ok() {
 # skip every package after the first) — it is checked here, per package/stream,
 # against the exact run_id.
 process_artifact() {
-  local run_id="$1" run_url="$2" adir="$3" idx_bioc="$4" idx_release="$5" attempts_file="$6"
+  local run_id="$1" run_url="$2" adir="$3" attempts_file="$4"
   local staged="$adir/staged.json"
   [[ -f "$staged" ]] || { log "run $run_id: $adir has no staged.json, skipping"; return 0; }
 
-  local pkg stream status universe commit manifest_commit
+  local pkg stream status universe commit
   pkg=$(jq -r '.package' "$staged")
   stream=$(jq -r '.stream' "$staged")
   status=$(jq -r '.status' "$staged")
   universe=$(universe_of_stream "$stream")
   commit=$(jq -r '.source.commit' "$staged")
-  manifest_commit=$(jq -r '.manifest_commit' "$staged")
-  local idxfile="$idx_bioc"
-  [[ "$universe" == "bioc-release" ]] && idxfile="$idx_release"
 
   # Authoritative check (staged.json is truth; the artifact name used for the
   # pre-download precheck in main() is only a hint) — repeated here in case
@@ -231,34 +206,18 @@ process_artifact() {
     fi
   fi
 
-  if [[ -z "$reject_reason" ]]; then
-    local m_state m_git_url m_streams m_component m_profile staged_git_url
-    m_state=$(manifest_get "$pkg" "$manifest_commit" "state")
-    m_git_url=$(manifest_get "$pkg" "$manifest_commit" "git_url")
-    m_streams=$(manifest_get "$pkg" "$manifest_commit" "streams")
-    m_component=$(manifest_get "$pkg" "$manifest_commit" "component")
-    m_profile=$(manifest_get "$pkg" "$manifest_commit" "profile")
-    staged_git_url=$(jq -r '.source.git_url' "$staged")
-    if [[ "$m_state" != "active" ]]; then reject_reason="manifest-state"
-    elif [[ "$m_git_url" != "$staged_git_url" ]]; then reject_reason="manifest-git-url"
-    elif [[ "$m_streams" != *"$stream"* ]]; then reject_reason="manifest-stream"
-    elif [[ "$m_component" != "$m_profile" ]]; then reject_reason="manifest-component"
-    else
-      local version; version=$(jq -r '.version' "$staged")
-      version_gate_ok "$idxfile" "$pkg" "$version" || reject_reason="version-gate"
-    fi
-  fi
-
+  # Integrity ends here. Authorization (manifest) and propagation (version,
+  # deps) are the route's gate — see publish_ok.
   if [[ -n "$reject_reason" ]]; then
     log "$pkg/$stream (run $run_id): rejected:$reject_reason"
     record_attempt "$universe" "$pkg" "$run_id" "$commit" "rejected:$reject_reason" "$run_url"
     return 0
   fi
 
-  publish_ok "$universe" "$pkg" "$run_id" "$commit" "$run_url" "$staged" "$tarball_sha" "$idxfile"
+  publish_ok "$universe" "$pkg" "$run_id" "$commit" "$run_url" "$staged" "$tarball_sha"
 }
 
-# process_artifact_safe <run_id> <run_url> <artifact_dir> <idx_bioc> <idx_release> <attempts_file> <artifact_name>
+# process_artifact_safe <run_id> <run_url> <artifact_dir> <attempts_file> <artifact_name>
 # SPEC-014: one bad artifact must never abort the sweep. This runs
 # process_artifact in a genuinely separate `bash` PROCESS, not a `(...)`
 # subshell of this one — verified the hard way: bash's errexit is deliberately
@@ -278,12 +237,12 @@ process_artifact() {
 # so it cannot be trusted here) and reports failure to the caller so it can
 # move on to the next artifact instead of the whole script exiting.
 process_artifact_safe() {
-  local run_id="$1" run_url="$2" adir="$3" idx_bioc="$4" idx_release="$5" attempts_file="$6" name="$7"
+  local run_id="$1" run_url="$2" adir="$3" attempts_file="$4" name="$5"
   local status=0
   DRY_RUN="${DRY_RUN:-0}" bash -euo pipefail -c '
     source "$1"; shift
     process_artifact "$@"
-  ' _ "${BASH_SOURCE[0]}" "$run_id" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file" || status=$?
+  ' _ "${BASH_SOURCE[0]}" "$run_id" "$run_url" "$adir" "$attempts_file" || status=$?
   [[ "$status" -eq 0 ]] && return 0
   log "run $run_id: $name errored during processing, recording rejected:internal-error and continuing"
   record_attempt "$(universe_of_stream "$(stream_of "$name")")" "$(package_of "$name")" \
@@ -320,9 +279,6 @@ main() {
   # One index.json per universe, cached for the whole sweep and updated in
   # place as packages publish (see publish_ok) so the version gate sees a
   # package published earlier in this same sweep.
-  local idx_bioc="$WORK/index-bioc.json" idx_release="$WORK/index-bioc-release.json"
-  fetch_or_empty "prop/bioc/index.json" > "$idx_bioc"
-  fetch_or_empty "prop/bioc-release/index.json" > "$idx_release"
 
   local n=0 err=0
   while read -r run; do
@@ -355,7 +311,7 @@ main() {
       local adir="$WORK/run-$rid/$name"
       mkdir -p "$adir"
       if gh run download "$rid" -R "$BUILD_REPO" -n "$name" -D "$adir" >/dev/null 2>&1; then
-        process_artifact_safe "$rid" "$run_url" "$adir" "$idx_bioc" "$idx_release" "$attempts_file" "$name" \
+        process_artifact_safe "$rid" "$run_url" "$adir" "$attempts_file" "$name" \
           || err=$((err + 1))
       else
         log "run $rid: download failed for artifact $name"

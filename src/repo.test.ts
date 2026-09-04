@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approveByDeps, buildManifest, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
+import { approveByDeps, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -745,4 +745,73 @@ test("approveByDeps: a mutual dependency cycle cannot deadlock the whole wave", 
   // neither can go first and both wait. C is unaffected.
   assert.deepEqual(approved.map((c) => c.package), ["C"]);
   assert.deepEqual(blocked.map((b) => b.package), ["A", "B"]);
+});
+
+// ---------- the consolidated gate ----------
+const GATE_CFG = { gating_r: "4.6", bioccheck: "advisory" as const, replace_seed: false };
+const LINUX_OK = [{ config: "linux-x86_64", r: "4.6.1", check: "OK" }];
+const cand = (o: Partial<Parameters<typeof gate>[0][number]> = {}) => ({
+  package: "msdata", version: "0.52.0", origin: "bioc-build" as const,
+  build_status: "success", jobs: LINUX_OK, desc: { Depends: "R (>= 4.1.0)" }, ...o,
+});
+const rules = (d: { reasons: { rule: string; ok: boolean }[] }) =>
+  Object.fromEntries(d.reasons.map((r) => [r.rule, r.ok]));
+
+test("gate: a clean first publication propagates and every rule reports", () => {
+  const { decisions, approved } = gate([cand()], GATE_CFG, {});
+  const d = decisions.msdata;
+  assert.equal(d.propagate, true);
+  assert.deepEqual(d.archs, ["linux"]);
+  assert.deepEqual(rules(d), {
+    "build-status": true, families: true, bioccheck: true, "version-parse": true,
+    "version-gate": true, deps: true,
+  });
+  assert.deepEqual(approved, ["msdata"]);
+});
+
+test("gate: version-gate is strict; replace_seed lets bioc-build replace a bioconductor seed once", () => {
+  const seeded = { msdata: { version: "0.52.0", sha256: "x", ts: "t", artifacts: [], origin: "bioconductor" as const } };
+  const ours = { msdata: { version: "0.52.0", sha256: "x", ts: "t", artifacts: [], origin: "bioc-build" as const } };
+  assert.equal(gate([cand()], GATE_CFG, seeded).decisions.msdata.propagate, false);
+  assert.equal(gate([cand()], { ...GATE_CFG, replace_seed: true }, seeded).decisions.msdata.propagate, true);
+  const d = gate([cand()], { ...GATE_CFG, replace_seed: true }, ours).decisions.msdata;
+  assert.equal(d.propagate, false);
+  assert.equal(rejectedRule(d), "version-gate");
+  assert.match(d.reasons.find((r) => r.rule === "version-gate")!.detail!, /not > 0.52.0 \(bioc-build\)/);
+});
+
+test("gate: families need a passing job on the gating R line; bioccheck is advisory unless configured", () => {
+  const wrongR = cand({ jobs: [{ config: "linux-x86_64", r: "4.7.0", check: "OK" }] });
+  assert.equal(rejectedRule(gate([wrongR], GATE_CFG, {}).decisions.msdata), "families");
+  const bcErr = cand({ jobs: [...LINUX_OK, { config: "bioc-checks", check: "ERROR" }] });
+  assert.equal(gate([bcErr], GATE_CFG, {}).decisions.msdata.propagate, true);
+  assert.equal(rejectedRule(gate([bcErr], { ...GATE_CFG, bioccheck: "blocking" }, {}).decisions.msdata), "bioccheck");
+  assert.equal(rejectedRule(gate([cand({ build_status: "failed:build" })], GATE_CFG, {}).decisions.msdata), "build-status");
+  assert.equal(rejectedRule(gate([cand({ version: "abc" })], GATE_CFG, {}).decisions.msdata), "version-parse");
+});
+
+test("gate: manifest rules apply only when a manifest block is present", () => {
+  const m = { state: "active", git_url: "https://git.bioconductor.org/packages/msdata",
+              streams: ["release", "devel"], component: "data-experiment", profile: "data-experiment" };
+  const ok = cand({ manifest: m, source_git_url: m.git_url, stream: "release" });
+  assert.equal(gate([ok], GATE_CFG, {}).decisions.msdata.propagate, true);
+  assert.equal(rejectedRule(gate([cand({ ...ok, manifest: null })], GATE_CFG, {}).decisions.msdata), "manifest");
+  assert.equal(rejectedRule(gate([cand({ ...ok, manifest: {} })], GATE_CFG, {}).decisions.msdata), "manifest-state");
+  assert.equal(rejectedRule(gate([cand({ ...ok, stream: "oldrel" })], GATE_CFG, {}).decisions.msdata), "manifest-stream");
+  assert.equal(rejectedRule(gate([cand({ ...ok, manifest: { ...m, git_url: "https://github.com/x/msdata" } })], GATE_CFG, {}).decisions.msdata), "manifest-git-url");
+  assert.equal(rejectedRule(gate([cand({ ...ok, manifest: { ...m, profile: "workflows" } })], GATE_CFG, {}).decisions.msdata), "manifest-component");
+  assert.ok(!("manifest-state" in rules(gate([cand()], GATE_CFG, {}).decisions.msdata)), "no manifest rules without a manifest block");
+});
+
+test("gate: deps rule is the wave fixpoint, ordered dependency-first, and blocks with the unmet requirement", () => {
+  const idx = { S4Vectors: { version: "0.50.1", sha256: "a", ts: "t", artifacts: [] } };
+  const iranges = cand({ package: "IRanges", version: "2.60.0", desc: { Imports: "S4Vectors (>= 0.51.0)" } });
+  const s4 = cand({ package: "S4Vectors", version: "0.51.0", desc: {} });
+  const alone = gate([iranges], GATE_CFG, idx).decisions.IRanges;
+  assert.equal(alone.propagate, false);
+  assert.equal(rejectedRule(alone), "deps");
+  assert.match(alone.reasons.at(-1)!.detail!, /S4Vectors \(>= 0.51.0\), published 0.50.1/);
+  const both = gate([iranges, s4], GATE_CFG, idx);
+  assert.deepEqual(both.approved, ["S4Vectors", "IRanges"]);
+  assert.equal(both.decisions.IRanges.propagate, true);
 });
