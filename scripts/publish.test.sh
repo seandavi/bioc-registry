@@ -109,13 +109,19 @@ else
   echo "$OUT" >&2
   exit 1
 fi
-OUT=$(DRY_RUN=1 process_artifact "222" "https://example/run/222" "$ADIR" "$ATT" 2>&1 || true)
+OUT=$(DRY_RUN=1 process_artifact "1222" "https://example/run/1222" "$ADIR" "$ATT" 2>&1 || true)
 if grep -q "already recorded" <<<"$OUT"; then
-  echo "not ok - process_artifact should NOT skip msdata/release at a different run_id (222)" >&2
+  echo "not ok - process_artifact should NOT skip msdata/release at a NEWER run_id (1222)" >&2
   echo "$OUT" >&2
   exit 1
 else
-  echo "ok - process_artifact does not skip a different run_id for the same package/stream"
+  echo "ok - process_artifact does not skip a newer run_id for the same package/stream"
+OUT=$(DRY_RUN=1 process_artifact "555" "https://example/run/555" "$ADIR" "$ATT" 2>&1)
+if grep -q "already recorded" <<<"$OUT"; then
+  echo "ok - process_artifact skips an OLDER run_id (555 < recorded 999)"
+else
+  echo "not ok - process_artifact should have skipped older run_id 555" >&2; exit 1
+fi
 fi
 rm -rf "$ATT" "$ADIR"
 

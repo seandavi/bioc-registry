@@ -73,9 +73,15 @@ package_of() { local n="${1#staged-}"; echo "${n%-*}"; }
 stream_of() { echo "${1##*-}"; }
 
 # already_recorded <package> <stream> <run_id> <attempts_file>
+# already_recorded <package> <stream> <run_id> <attempts.json>
+# attempts.json keeps ONE record per package/stream — the latest run — so
+# "recorded" has to mean "this run or an older one". GitHub run ids are
+# monotonic; with plain equality the second-newest run in the 100-run window
+# stopped being "recorded" the moment a newer one landed, got re-downloaded,
+# and was refused by its own version, every sweep (2026-09-04, msdata).
 already_recorded() {
   jq -e --arg p "$1" --arg s "$2" --arg rid "$3" \
-    '(.[$p][$s].run_id // "") == $rid' "$4" >/dev/null 2>&1
+    '((.[$p][$s].run_id // "0") | tonumber) >= ($rid | tonumber)' "$4" >/dev/null 2>&1
 }
 
 build_entry() {
