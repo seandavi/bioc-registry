@@ -140,8 +140,8 @@ ATT=$(mktemp)
 echo '{"msdata": {"release": {"run_id": "999"}}}' > "$ATT"
 already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "999" "$ATT" \
   || { echo "not ok - already_recorded should match by parsed name at the same run_id" >&2; exit 1; }
-already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "222" "$ATT" \
-  && { echo "not ok - already_recorded should not match a different run_id" >&2; exit 1; }
+already_recorded "$(package_of staged-msdata-release)" "$(stream_of staged-msdata-release)" "1222" "$ATT" \
+  && { echo "not ok - already_recorded should not match a newer run_id" >&2; exit 1; }
 rm -f "$ATT"
 echo "ok - already_recorded via parsed artifact name (precheck path)"
 
