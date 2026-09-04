@@ -41,6 +41,11 @@ log() { echo "[publish] $*" >&2; }
 aws_s3() {
   aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" s3 "$@"
 }
+# `aws s3api`, not `aws s3 api`: the latter is not a command, so the CAS
+# exists-check below always failed and every tarball re-uploaded each sweep.
+aws_s3api() {
+  aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" s3api "$@"
+}
 
 # POST to the guarded /publish route. $1 = JSON body.
 post_publish() {
@@ -144,7 +149,7 @@ publish_ok() {
   if [[ "${DRY_RUN:-0}" == 1 ]]; then
     log "dry-run: would upload $pkg to prop/$universe/cas/$sha256 and logs/bioc-build/$run_id/"
   else
-    if ! aws_s3 api head-object --bucket "$BUCKET" --key "prop/$universe/cas/$sha256" >/dev/null 2>&1; then
+    if ! aws_s3api head-object --bucket "$BUCKET" --key "prop/$universe/cas/$sha256" >/dev/null 2>&1; then
       aws_s3 cp "$adir/$tarball_file" "s3://$BUCKET/prop/$universe/cas/$sha256"
     fi
     [[ -d "$adir/logs" ]] && aws_s3 cp --recursive "$adir/logs" "s3://$BUCKET/logs/bioc-build/$run_id/"
