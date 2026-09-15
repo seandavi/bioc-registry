@@ -27,7 +27,16 @@ jobs:
       REPO_URL: https://bioc-registry.seandavi.workers.dev/repo/${{ matrix.universe }}
     steps:
       - name: gh CLI for attestation verify (not in the image)
-        run: apt-get update && apt-get install -y gh
+        # From GitHub's own apt repo: Ubuntu's packaged gh predates
+        # `gh attestation`, which the last step needs.
+        run: |
+          install -d -m 755 /etc/apt/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update && apt-get install -y gh
+          gh --version
 
       - name: Install pinned canaries (edgeR, limma)
         # Popular, modest dependency trees, present in both universes.
