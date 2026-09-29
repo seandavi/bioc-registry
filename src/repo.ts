@@ -49,7 +49,7 @@ export function metaOf(p: Partial<Record<(typeof META_FIELDS)[number], string>> 
 // pointers, prop/*/index.json, the seed plan — is rewritten in place, and
 // serving those with a long immutable cache hands out a stale index.
 export const writeOnce = (key: string) =>
-  /^(obs|parquet|logs|checks|builds)\/|\/(cas|log|pending|blocked)\//.test(key);
+  /^(obs|parquet|logs|checks|builds)\/|\/(cas|log|pending|blocked|topup)\//.test(key);
 
 // Fresh metadata from an observation replaces what was stored, so a field the
 // package dropped upstream disappears here too. git_url is the exception: it
@@ -229,6 +229,62 @@ export function passingFamilies(jobs: GateJob[], rMinor: string): Family[] {
     good.set(f, (good.get(f) ?? true) && !GATE_BAD.has(j.check ?? ""));
   }
   return GATE_FAMILIES.filter((f) => good.get(f) === true);
+}
+
+export type ObsBinary = {
+  os: string; r?: string; version?: string; fileid?: string; status?: string;
+  arch?: string; distro?: string;
+};
+
+// The binaries of one observed build that may ride with `version`: built
+// successfully, of that version, and for a family the gate passed. wasm has no
+// gating job, so it stays advisory and rides along.
+export function binaryArtifacts(
+  pkg: string, version: string, bins: ObsBinary[] | undefined, archs: readonly string[]
+): Artifact[] {
+  return (bins ?? [])
+    .filter((b) => b.status === "success" && b.fileid && b.version === version)
+    .filter((b) => b.os === "wasm" || archs.includes(b.os))
+    .map((b) => ({
+      os: b.os, r: b.r ?? "", sha256: b.fileid!.split("/").pop()!,
+      arch: b.arch, distro: b.distro,
+      file: `${pkg}_${version}.${PKG_EXT[b.os] ?? "tar.gz"}`,
+    }));
+}
+
+// One binary per (os, R minor, arch): what the repo serves from. A slot already
+// filled keeps its binary, so a top-up never swaps one build for another. Not
+// distro: entries published before it was recorded carry none, and r-universe
+// builds one distro per R line.
+const slot = (a: Artifact) => [a.os, rMinor(a.r), normArch(a.arch ?? "")].join("|");
+
+// Binaries a published r-universe version gained since it was published (#50).
+// The gate decides binaries in the wave that first publishes a version, and the
+// version gate keeps that version out of every later wave, so without this a
+// platform whose check passes on a same-version rebuild, or a binary that
+// finishes after the source was published, never arrives. Additive only: the
+// source, its sha256 and the version never change here, and a family that
+// passed once is never withdrawn. null = nothing to add.
+export function topUpBinaries(
+  e: PropIndex[string],
+  p: { Package: string; Version?: string; _jobs?: GateJob[]; _binaries?: ObsBinary[] },
+  gatingR: string
+): { artifacts: Artifact[]; archs: string[] } | null {
+  if (originOf(e) !== "r-universe" || p.Version !== e.version) return null;
+  // No archs = published under the earlier all-green gate, which passed every
+  // family; those entries can still be missing a late binary.
+  const before = e.archs ?? GATE_FAMILIES;
+  const passing = passingFamilies(p._jobs ?? [], gatingR);
+  const archs = GATE_FAMILIES.filter((f) => before.includes(f) || passing.includes(f));
+  const have = new Set(e.artifacts.map(slot));
+  const add: Artifact[] = [];
+  for (const a of binaryArtifacts(p.Package, e.version, p._binaries, archs)) {
+    if (have.has(slot(a))) continue;
+    have.add(slot(a));
+    add.push(a);
+  }
+  const widened = archs.length !== before.length;
+  return add.length || widened ? { artifacts: add, archs } : null;
 }
 
 const DEP_ROLES = ["Depends", "Imports", "LinkingTo", "Suggests", "Enhances"] as const;
@@ -775,6 +831,20 @@ export function seedArtifacts(
       file: `${stem}.tgz`,
     });
   return out;
+}
+
+// Binaries a seed can gain (#50). A seed copies only the binaries whose version
+// matched the source when it was seeded, and Bioconductor's binaries often lag
+// its source; once they catch up to the seeded version, fetch them. Only slots
+// the entry lacks, so a seeded binary is never replaced.
+export function seedBinaryTopUp(
+  e: PropIndex[string], pkg: string, rMinor: string,
+  has: { win?: boolean; macArm?: boolean; macX86?: boolean }
+): SeedArtifact[] {
+  if (originOf(e) !== "bioconductor") return [];
+  const have = new Set(e.artifacts.map(slot));
+  return seedArtifacts(pkg, e.version, rMinor, has)
+    .filter((a) => a.os !== "src" && !have.has(slot({ ...a, sha256: "" })));
 }
 
 // ---------- observation merge (SCD type 2) ----------

@@ -3,7 +3,7 @@
 // docs/api.md are updated with it — nothing here is generated, so nothing breaks
 // loudly when it drifts.
 //
-// Deliberately omitted: /poll, /backfill, /reindex, /seed, /publish. They are
+// Deliberately omitted: /poll, /backfill, /reindex, /seed, /publish, /topup. They are
 // side-effecting routes gated only by a shared secret, and a try-it button next
 // to /backfill (or /publish) is an invitation. See docs/api.md for these instead.
 
