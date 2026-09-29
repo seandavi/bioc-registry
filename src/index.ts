@@ -10,6 +10,7 @@ import {
   viewsDcf, writeOnce, JobRow, RowState,
   validatePublish, upsertEntry, mergeAttempt, AttemptRecord,
   gate, rejectedRule, R_VER, GateConfig, GateInput, GateManifest, gateInputFromStaged,
+  binaryArtifacts, topUpBinaries, seedBinaryTopUp, GATE_FAMILIES,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
 
@@ -561,14 +562,7 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
         os: "src", r: "", sha256: p._sha256!,
         file: p._file || `${p.Package}_${p.Version}.tar.gz`,
       },
-      ...(p._binaries ?? [])
-        .filter((b) => b.status === "success" && b.fileid && b.version === p.Version)
-        .filter((b) => b.os === "wasm" || archs.includes(b.os as Family))
-        .map((b) => ({
-          os: b.os, r: b.r ?? "", sha256: b.fileid!.split("/").pop()!,
-          arch: b.arch, distro: b.distro,
-          file: `${p.Package}_${p.Version}.${PKG_EXT[b.os] ?? "tar.gz"}`,
-        })),
+      ...binaryArtifacts(p.Package, p.Version!, p._binaries, archs),
     ];
     return {
       package: p.Package, version: p.Version!, sha256: p._sha256!,
@@ -663,6 +657,101 @@ async function propagateBatch(env: Env, universe: string, pendingKey: string, st
     };
   await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
   return { start, packages: batch.length, copied };
+}
+
+// ---------- binary top-up (#50) ----------
+// A version's binaries are otherwise decided once, in the wave that publishes
+// it. Runs at the end of every wave, and from /topup for a backfill. Copies at
+// most `limit` artifacts per call (3 subrequests each) and reports what is left,
+// so the workflow can loop in steps. An artifact that fails to copy is skipped
+// and retried next wave, never recorded.
+const TOPUP_LIMIT = 40;
+
+type TopUpResult = { added: number; packages: number; failed: number; remaining: number };
+
+async function applyTopUp(
+  env: Env, universe: string, kind: string,
+  adds: { pkg: string; version: string; sha256: string; artifacts: Artifact[]; archs?: string[] }[]
+) {
+  const ts = new Date().toISOString();
+  // Re-read after the copies, and only touch an entry still at the version and
+  // source the plan saw: a wave may have published a newer version meanwhile.
+  const idx = await readIndex(env, universe);
+  let packages = 0;
+  for (const a of adds) {
+    const e = idx[a.pkg];
+    if (!e || e.version !== a.version || e.sha256 !== a.sha256) continue;
+    const have = new Set(e.artifacts.map((x) => x.sha256));
+    const fresh = a.artifacts.filter((x) => !have.has(x.sha256));
+    const widened = !!a.archs && a.archs.join() !== (e.archs ?? GATE_FAMILIES).join();
+    if (!fresh.length && !widened) continue;
+    e.artifacts.push(...fresh);
+    if (widened) e.archs = a.archs;
+    packages++;
+    await env.ARCHIVE.put(
+      `prop/${universe}/topup/${ts}-${a.pkg}_${a.version}.json`,
+      JSON.stringify({ package: a.pkg, version: a.version, kind, ts, artifacts: fresh, archs: e.archs })
+    );
+  }
+  if (packages) await env.ARCHIVE.put(`prop/${universe}/index.json`, JSON.stringify(idx));
+  return packages;
+}
+
+async function topUp(env: Env, universe: string, obsKey: string, limit = TOPUP_LIMIT): Promise<TopUpResult> {
+  const obs = await env.ARCHIVE.get(obsKey);
+  if (!obs) throw new Error(`missing observation ${obsKey}`);
+  const byName = new Map((await obs.json<FullPkg[]>()).map((p) => [p.Package, p]));
+  const idx = await readIndex(env, universe);
+  const gatingR = await gatingRMinor(universe);
+  const adds: Parameters<typeof applyTopUp>[3] = [];
+  let budget = limit, remaining = 0, failed = 0;
+  for (const [name, e] of Object.entries(idx)) {
+    const p = byName.get(name);
+    const t = p && topUpBinaries(e, p, gatingR);
+    if (!t) continue;
+    const copied: Artifact[] = [];
+    for (const a of t.artifacts) {
+      if (budget <= 0) { remaining++; continue; }
+      budget--;
+      try { await copyCas(env, universe, a.sha256); copied.push(a); } catch { failed++; }
+    }
+    adds.push({ pkg: name, version: e.version, sha256: e.sha256, artifacts: copied, archs: t.archs });
+  }
+  const packages = await applyTopUp(env, universe, "r-universe", adds);
+  return { added: adds.reduce((n, a) => n + a.artifacts.length, 0), packages, failed, remaining };
+}
+
+async function topUpSeeds(env: Env, universe: string, limit = TOPUP_LIMIT): Promise<TopUpResult> {
+  const idx = await readIndex(env, universe);
+  const seeds = Object.entries(idx).filter(([, e]) => originOf(e) === "bioconductor");
+  if (!seeds.length) return { added: 0, packages: 0, failed: 0, remaining: 0 };
+  const base = `https://bioconductor.org/packages/${BIOC_BRANCH[universe]}/bioc`;
+  const rMinor = await gatingRMinor(universe);
+  const [win, macArm, macX86] = await Promise.all([
+    fetchText(`${base}/bin/windows/contrib/${rMinor}/PACKAGES`),
+    fetchText(`${base}/bin/macosx/${macArmDir(rMinor)}/contrib/${rMinor}/PACKAGES`),
+    fetchText(`${base}/bin/macosx/${MAC_X86_DIR}/contrib/${rMinor}/PACKAGES`),
+  ]);
+  const versions = (dcf: string) => new Map(parseDcf(dcf).map((r) => [r.Package, r.Version]));
+  const w = versions(win), ma = versions(macArm), mx = versions(macX86);
+  const adds: Parameters<typeof applyTopUp>[3] = [];
+  let budget = limit, remaining = 0, failed = 0;
+  for (const [name, e] of seeds) {
+    const want = seedBinaryTopUp(e, name, rMinor, {
+      win: w.get(name) === e.version, macArm: ma.get(name) === e.version, macX86: mx.get(name) === e.version,
+    });
+    const copied: Artifact[] = [];
+    for (const a of want) {
+      if (budget <= 0) { remaining++; continue; }
+      budget--;
+      const sha256 = await copySeedArtifact(env, universe, `${base}/${a.path}`).catch(() => null);
+      if (!sha256) { failed++; continue; }
+      copied.push({ os: a.os, r: a.r, arch: a.arch, sha256, file: a.file });
+    }
+    if (copied.length) adds.push({ pkg: name, version: e.version, sha256: e.sha256, artifacts: copied });
+  }
+  const packages = await applyTopUp(env, universe, "bioconductor-seed", adds);
+  return { added: adds.reduce((n, a) => n + a.artifacts.length, 0), packages, failed, remaining };
 }
 
 // ---------- one-time seed from the official Bioconductor repos ----------
@@ -1476,7 +1565,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
     if (
       env.MAINT_KEY &&
       (pathname === "/poll" || pathname === "/reindex" || pathname === "/backfill" ||
-        pathname === "/seed" || pathname === "/publish") &&
+        pathname === "/seed" || pathname === "/publish" || pathname === "/topup") &&
       req.headers.get("x-maint-key") !== env.MAINT_KEY
     ) {
       return new Response("forbidden", { status: 403 });
@@ -1724,6 +1813,19 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       const refresh = url.searchParams.get("refresh") === "1";
       return new Response(await seedBatch(env, u, start, refresh) + "\n");
     }
+    if (pathname === "/topup") {
+      const u = url.searchParams.get("universe") ?? "";
+      if (!UNIVERSES.includes(u))
+        return new Response("topup: ?universe=bioc|bioc-release required\n", { status: 400 });
+      const last = await env.ARCHIVE.get(`state/${u}/latest`);
+      if (!last) return new Response(`${u}: no observations\n`, { status: 404 });
+      const { key } = await last.json<{ key: string }>();
+      const r = await topUp(env, u, key);
+      const s2 = await topUpSeeds(env, u);
+      return new Response(JSON.stringify({ universe: u, "r-universe": r, seeds: s2 }) + "\n", {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    }
     if (pathname === "/reindex") {
       const results = await Promise.all(UNIVERSES.map((u) => reindex(u, env)));
       // Mutating GET: without no-store the edge caches the result and a later
@@ -1835,6 +1937,18 @@ export class ObserveWorkflow extends WorkflowEntrypoint<Env, ObserveParams> {
         propagateBatch(this.env, universe, pendingKey, start)
       );
       await step.sleep(`pause-${start}`, "1 second");
+    }
+    if (end >= count) {
+      // Same universe, same instance, after propagation: nothing else in this
+      // wave writes the index concurrently.
+      for (let i = 0; i < 10; i++) {
+        const r = await step.do(`topup-${i}`, () => topUp(this.env, universe, key));
+        if (!r.remaining) break;
+      }
+      for (let i = 0; i < 5; i++) {
+        const r = await step.do(`topup-seeds-${i}`, () => topUpSeeds(this.env, universe));
+        if (!r.remaining) break;
+      }
     }
     if (end < count) {
       await step.do("continue", async () => {

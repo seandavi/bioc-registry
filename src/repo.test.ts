@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approveByDeps, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
+import { approveByDeps, binaryArtifacts, seedBinaryTopUp, topUpBinaries, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -814,4 +814,123 @@ test("gate: deps rule is the wave fixpoint, ordered dependency-first, and blocks
   const both = gate([iranges, s4], GATE_CFG, idx);
   assert.deepEqual(both.approved, ["S4Vectors", "IRanges"]);
   assert.equal(both.decisions.IRanges.propagate, true);
+});
+
+// ---------- binary top-up (#50) ----------
+
+const bin = (os: string, arch: string, sha: string, extra = {}) => ({
+  os, r: "4.6.1", version: "3.46.1", status: "success", arch,
+  fileid: `https://r2.ropensci.org/${sha}`, ...extra,
+});
+const published = () => ({
+  version: "3.46.1", sha256: "src1", ts: "2026-08-13T00:00:00Z",
+  archs: ["linux", "win"],
+  artifacts: [
+    { os: "src", r: "", sha256: "src1", file: "ChIPpeakAnno_3.46.1.tar.gz" },
+    { os: "win", r: "4.6.1", sha256: "win1", arch: "x86_64", file: "ChIPpeakAnno_3.46.1.zip" },
+  ],
+});
+const jobs = (mac: string) => [
+  { config: "source", r: "4.6.1", check: "OK" },
+  { config: "linux-release-x86_64", r: "4.6.1", check: "OK" },
+  { config: "windows-release-x86_64", r: "4.6.1", check: "OK" },
+  { config: "macos-release-arm64", r: "4.6.1", check: mac },
+];
+
+test("topUpBinaries adds a platform that passes on a same-version rebuild", () => {
+  const e = published();
+  const t = topUpBinaries(e, {
+    Package: "ChIPpeakAnno", Version: "3.46.1", _jobs: jobs("OK"),
+    _binaries: [bin("win", "x86_64", "win2"), bin("mac", "aarch64", "mac1"), bin("mac", "x86_64", "mac2")],
+  }, "4.6");
+  assert.deepEqual(t?.archs, ["linux", "win", "mac"]);
+  // Both mac chips ride the arm64 verdict; the rebuilt win binary does not
+  // displace the one already published for that slot.
+  assert.deepEqual(t?.artifacts.map((a) => a.sha256), ["mac1", "mac2"]);
+  assert.equal(t?.artifacts[0].file, "ChIPpeakAnno_3.46.1.tgz");
+  // The source and version are never touched.
+  assert.equal(e.sha256, "src1");
+  assert.equal(e.artifacts.length, 2);
+});
+
+test("topUpBinaries adds nothing for a platform that still fails", () => {
+  const t = topUpBinaries(published(), {
+    Package: "ChIPpeakAnno", Version: "3.46.1", _jobs: jobs("ERROR"),
+    _binaries: [bin("mac", "aarch64", "mac1")],
+  }, "4.6");
+  assert.equal(t, null);
+});
+
+test("topUpBinaries adds a binary built after the source was published", () => {
+  // SparseArray: published with archs win+mac but only src, binaries a day later.
+  const e = {
+    version: "1.13.3", sha256: "s", ts: "2026-09-23T07:01:14Z", archs: ["win", "mac"],
+    artifacts: [{ os: "src", r: "", sha256: "s", file: "SparseArray_1.13.3.tar.gz" }],
+  };
+  const v = { version: "1.13.3" };
+  const t = topUpBinaries(e, {
+    Package: "SparseArray", Version: "1.13.3",
+    _jobs: [{ config: "linux-release-x86_64", r: "4.6.1", check: "ERROR" }],
+    _binaries: [bin("win", "x86_64", "w", v), bin("mac", "aarch64", "m", v), bin("linux", "x86_64", "l", v),
+      bin("win", "x86_64", "fail", { ...v, status: "failure" })],
+  }, "4.6");
+  // A family passed once is kept (additive); linux never passed, so no linux binary.
+  assert.deepEqual(t?.archs, ["win", "mac"]);
+  assert.deepEqual(t?.artifacts.map((a) => a.sha256), ["w", "m"]);
+});
+
+test("topUpBinaries leaves other versions, seeds and bioc-build entries alone", () => {
+  const obs = { Package: "ChIPpeakAnno", _jobs: jobs("OK"), _binaries: [bin("mac", "aarch64", "mac1")] };
+  assert.equal(topUpBinaries(published(), { ...obs, Version: "3.46.2" }, "4.6"), null);
+  for (const origin of ["bioconductor", "bioc-build"] as const)
+    assert.equal(topUpBinaries({ ...published(), origin }, { ...obs, Version: "3.46.1" }, "4.6"), null);
+  // Nothing new: already up to date.
+  const done = topUpBinaries(published(), { ...obs, Version: "3.46.1", _jobs: jobs("ERROR"), _binaries: [] }, "4.6");
+  assert.equal(done, null);
+});
+
+test("binaryArtifacts keeps only successful builds of the version, for passing families or wasm", () => {
+  const a = binaryArtifacts("P", "1.0", [
+    { os: "win", r: "4.6.1", version: "1.0", status: "success", fileid: "x/a" },
+    { os: "mac", r: "4.6.1", version: "1.0", status: "success", fileid: "x/b" },
+    { os: "wasm", r: "4.6.0", version: "1.0", status: "success", fileid: "x/c" },
+    { os: "win", r: "4.6.1", version: "0.9", status: "success", fileid: "x/d" },
+    { os: "win", r: "4.6.1", version: "1.0", status: "success" },
+  ], ["win"]);
+  assert.deepEqual(a.map((x) => [x.sha256, x.file]), [["a", "P_1.0.zip"], ["c", "P_1.0.tar.gz"]]);
+});
+
+test("seedBinaryTopUp fetches only binaries that caught up to the seeded version, into empty slots", () => {
+  const e = {
+    version: "1.54.0", sha256: "s", ts: "t", archs: [], origin: "bioconductor" as const,
+    artifacts: [
+      { os: "src", r: "", sha256: "s", file: "AnnotationForge_1.54.0.tar.gz" },
+      { os: "mac", r: "4.6", arch: "arm64", sha256: "m", file: "AnnotationForge_1.54.0.tgz" },
+    ],
+  };
+  const want = seedBinaryTopUp(e, "AnnotationForge", "4.6", { win: true, macArm: true, macX86: false });
+  assert.deepEqual(want.map((a) => a.path), ["bin/windows/contrib/4.6/AnnotationForge_1.54.0.zip"]);
+  assert.deepEqual(seedBinaryTopUp({ ...e, origin: undefined }, "AnnotationForge", "4.6", { win: true }), []);
+});
+
+test("topUpBinaries matches slots on real index shapes: no distro recorded, no archs recorded", () => {
+  // limma: published under the all-green gate (no archs), linux artifacts
+  // recorded without distro; the observation reports distro and rebuilt shas.
+  const e = {
+    version: "3.68.5", sha256: "s", ts: "t",
+    artifacts: [
+      { os: "src", r: "", sha256: "s" },
+      { os: "linux", r: "4.6.1", arch: "x86_64", sha256: "l1" },
+      { os: "win", r: "4.6.1", arch: "x86_64", sha256: "w1" },
+    ],
+  };
+  const obs = (bins: object[]) => ({ Package: "limma", Version: "3.68.5", _jobs: jobs("OK"), _binaries: bins as any });
+  const v = { version: "3.68.5" };
+  assert.equal(topUpBinaries(e, obs([
+    bin("linux", "x86_64", "l2", { ...v, distro: "resolute" }), bin("win", "x86_64", "w2", v),
+  ]), "4.6"), null);
+  // A genuinely missing slot is still added, and archs stays unrecorded-equivalent.
+  const t = topUpBinaries(e, obs([bin("mac", "aarch64", "m", v)]), "4.6");
+  assert.deepEqual(t?.artifacts.map((a) => a.sha256), ["m"]);
+  assert.deepEqual(t?.archs, ["linux", "win", "mac"]);
 });

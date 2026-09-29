@@ -210,7 +210,7 @@ Serves any object in the bucket by key (see [Storage keys](#storage-keys)).
 
 - Supports `Range` requests (returns `206` + `Content-Range`) and `HEAD` —
   this is what makes remote DuckDB/`httpfs` work against the parquet files.
-- Write-once objects (`obs/`, `parquet/`, `logs/`, `checks/`, `builds/`, `prop/*/cas/`, `prop/*/log/`,
+- Write-once objects (`obs/`, `parquet/`, `logs/`, `checks/`, `builds/`, `prop/*/cas/`, `prop/*/log/`, `prop/*/topup/`,
   `prop/*/pending/`) are served `immutable`. Everything rewritten in place —
   the `state/` pointers, `prop/{universe}/index.json`, the seed files — is
   served `no-store`, so a reader never gets a stale index.
@@ -304,8 +304,9 @@ Windows and both macOS `PACKAGES` files, and stores it at
 `prop/{universe}/seed/plan.json`; later calls read the plan instead of re-fetching
 ~8MB. `refresh=1` discards it, which is what a new Bioconductor release needs.
 
-A seeded entry is frozen: nothing re-reads Bioconductor for it, so it drifts as
-the official release gets patch bumps. The dashboard counts how many have fallen
+A seeded entry's *version* is frozen: nothing re-reads Bioconductor for it, so it drifts as
+the official release gets patch bumps. Its *binaries* are topped up (see
+[`/topup`](#get-topupuniversebiocbioc-release)). The dashboard counts how many have fallen
 behind rather than re-seeding on a timer — the fix for a drifted entry is the
 package propagating normally.
 
@@ -325,6 +326,34 @@ than defensive.
 Binaries come only from the binary directory's own `PACKAGES` at a matching
 version — the counts differ from source (release: 2384 source, 2305 Windows,
 2332 arm64, 2361 Intel), so a binary is never assumed to exist.
+
+### `GET /topup?universe={bioc|bioc-release}`
+
+Maintenance, requires `x-maint-key`. Adds binaries that a published version has
+gained since it was published (#50). The same two passes also run at the end of
+every observation workflow; this route is for a backfill, or to catch up without
+waiting for the next upstream change.
+
+- **r-universe entries**: for a package whose latest observation is still at the
+  published version, recompute the passing families (same rule as the gate) and
+  add each successful binary of that version for a passing family, or wasm, whose
+  slot (os, R minor, arch) the entry doesn't already fill. Covers a platform
+  whose check passes on a same-version rebuild, and a binary that finished after
+  the source was published. An entry without `archs` was published under the
+  earlier all-green gate and counts as having passed every family.
+- **Seeds** (`origin: "bioconductor"`): add a Windows or macOS binary once
+  Bioconductor's binary `PACKAGES` lists it at the seeded version.
+
+Additive only: the source, its `sha256` and the version never change, no filled
+slot is replaced, and a family that passed once is never withdrawn. Each call
+copies at most 40 artifacts per pass and reports what's left, so repeat until
+`remaining` is 0. An artifact that fails to copy is skipped and retried later.
+Each changed entry gets a ledger record under `prop/{universe}/topup/`.
+
+```json
+{"universe":"bioc","r-universe":{"added":40,"packages":12,"failed":0,"remaining":377},
+ "seeds":{"added":3,"packages":3,"failed":0,"remaining":0}}
+```
 
 ### `POST /publish`
 
@@ -478,6 +507,7 @@ All addressable through `/data/<key>`.
 | `prop/{universe}/seed/plan.json` | what a `/seed` run intends to seed: package, version, desc, meta, artifact paths |
 | `prop/{universe}/seed/official-versions.json` | every package version the official Bioconductor repo ships, for the seeded-drift count |
 | `prop/{universe}/log/{ts}-{pkg}_{ver}.json` | propagation ledger entry |
+| `prop/{universe}/topup/{ts}-{pkg}_{ver}.json` | binaries added to an already-published version: `{package, version, kind, ts, artifacts[], archs}`, `kind` is `r-universe` or `bioconductor-seed` |
 | `state/bioc-build/attempts.json` | `{ [package]: { [stream]: {commit, status, run_id, run_url, ts, attempts} } }` — every `/publish` attempt, one/two-stream, `stream` is `devel` (universe `bioc`) or `release` (universe `bioc-release`); read by `dispatch.yml` in bioc-build to skip a commit already attempted, and back off after repeated failures |
 | `state/bioc-build/published.json` | `{ [universe]: { [package]: <index entry> } }` — every entry `/publish` has ever accepted, re-POSTed by `publish.yml` each run so an index clobbered by a later r-universe write self-heals |
 
