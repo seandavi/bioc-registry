@@ -22,7 +22,7 @@ jobs:
     # vanilla runner + apt-get + a denylist of "packages the runner cannot
     # build", which was whack-a-mole and shrank the sample pool. (#47)
     container: ghcr.io/r-universe-org/base-image:release
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       REPO_URL: https://bioc-registry.seandavi.workers.dev/repo/${{ matrix.universe }}
     steps:
@@ -120,6 +120,9 @@ jobs:
               if (!length(bb)) quit(save = "no", status = 0)
               repos <- c(BIOC = Sys.getenv("REPO_URL"), CRAN = getOption("repos")[["CRAN"]])
               pkgs <- names(bb)
+              # The set is ~2 GB of tarballs, up to 536 MB each; R's default
+              # download timeout is 60 s.
+              options(timeout = max(3600, getOption("timeout")))
               install.packages(pkgs, repos = repos)
               invisible(lapply(pkgs, loadNamespace))
               cat("bioc-build-result: all", length(pkgs), "loaded\n")
