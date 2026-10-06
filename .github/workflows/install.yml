@@ -118,7 +118,11 @@ jobs:
               bb <- Filter(function(e) identical(e$origin, "bioc-build"), idx)
               cat("bioc-build entries:", length(bb), "\n")
               if (!length(bb)) quit(save = "no", status = 0)
-              repos <- c(BIOC = Sys.getenv("REPO_URL"), CRAN = getOption("repos")[["CRAN"]])
+              # Software comes from the registry (BioCsoft replaced) and CRAN;
+              # annotation/experiment data dependencies have no build home yet
+              # (bioc-build#32), so BioCann/BioCexp stay on the image mirror.
+              repos <- getOption("repos")
+              repos[["BioCsoft"]] <- Sys.getenv("REPO_URL")
               pkgs <- names(bb)
               # The set is ~2 GB of tarballs, up to 536 MB each; the default R
               # download timeout is 60 s.
