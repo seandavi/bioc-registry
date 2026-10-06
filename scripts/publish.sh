@@ -67,8 +67,13 @@ universe_of_stream() { [[ "$1" == "devel" ]] && echo "bioc" || echo "bioc-releas
 
 # staged_artifact_names <run_id> — names only, no bytes: lets the sweep skip a
 # run (or the packages in it already done) without downloading anything.
+#
+# --paginate: the endpoint returns 30 artifacts a page, and a dispatch.yml matrix
+# run holds one staged-*, package-source-* and bioc-checks-* artifact per
+# package/stream, so an unpaginated listing silently dropped most of a large
+# run (62 pairs = 186 artifacts: only ~10 packages were seen).
 staged_artifact_names() {
-  gh api "repos/$BUILD_REPO/actions/runs/$1/artifacts" --jq '.artifacts[].name' 2>/dev/null \
+  gh api --paginate "repos/$BUILD_REPO/actions/runs/$1/artifacts?per_page=100" --jq '.artifacts[].name' 2>/dev/null \
     | grep '^staged-' || true
 }
 
