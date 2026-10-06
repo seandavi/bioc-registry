@@ -120,7 +120,7 @@ jobs:
               if (!length(bb)) quit(save = "no", status = 0)
               repos <- c(BIOC = Sys.getenv("REPO_URL"), CRAN = getOption("repos")[["CRAN"]])
               pkgs <- names(bb)
-              # The set is ~2 GB of tarballs, up to 536 MB each; R's default
+              # The set is ~2 GB of tarballs, up to 536 MB each; the default R
               # download timeout is 60 s.
               options(timeout = max(3600, getOption("timeout")))
               install.packages(pkgs, repos = repos)
