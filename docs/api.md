@@ -75,6 +75,11 @@ curl -s "$B/data/$K" | jq -c '.[] | select(.Package=="edgeR")
 curl -s $B/logs/bioc/<job>
 ```
 
+Because capture reads only the latest observation, a job rebuilt before capture
+reaches it is never seen again. After an outage, `scripts/requeue.py` lists those
+jobs from the jobs parquet into `state/{universe}/requeue.json`, and the cron
+drains it (log and check together, 150 jobs a run) — see the script's docstring.
+
 **Whether capture is alive is visible in one place:**
 `curl -s .../data/state/bioc/logcursor`. That integer must move within a cron
 tick or two. It stays frozen when the token is missing (capture returns early)
@@ -500,6 +505,8 @@ All addressable through `/data/<key>`.
 | `checks/{universe}/{job}.json` | captured check logs for that job, keyed by file basename |
 | `builds/{universe}/{job}.json` | `{image, repos[], deps{}}` parsed from that job's log |
 | `state/{universe}/checkcursor` | `{job}` high-water mark for check-log capture |
+| `state/{universe}/requeue.json` | `[[job, artifact\|null], …]` superseded jobs the cursors never reached, built by `scripts/requeue.py` (#69) |
+| `state/{universe}/requeuepos` | `{i}` — how far the cron's `drainRequeue` has got through `requeue.json` |
 | `state/{universe}/manifestbackfill` | `{cursor}` into the `logs/` listing, or `{done:true}` — the one-time walk that gives already-captured logs a manifest |
 | `prop/{universe}/index.json` | `{ [package]: {version, sha256, ts, bioccheck, artifacts[], desc, meta, archs} }` — the propagated set |
 | `prop/{universe}/cas/{sha256}` | artifact bytes (source tarball or platform binary), keyed by content hash |
