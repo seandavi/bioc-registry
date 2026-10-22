@@ -130,15 +130,20 @@ async function captureLogs(universe: string, env: Env): Promise<string> {
 
   let mark = cursor;
   let saved = 0;
+  let stopped = "";
   for (const job of ids) {
     const gh = await fetch(
       `https://api.github.com/repos/r-universe/${universe}/actions/jobs/${job}/logs`,
       { headers: { "user-agent": "bioc-registry", authorization: `Bearer ${token}` } }
     );
-    // Out of budget: stop without advancing, so these ids are retried next run.
-    if (gh.status === 403 && gh.headers.get("x-ratelimit-remaining") === "0") break;
-    // Anything else terminal (404/410 = already expired upstream) is unrecoverable,
-    // so let the mark pass it rather than wedging the cursor on a dead job.
+    // Only 404/410 (already expired upstream) is terminal; the mark passes those
+    // rather than wedging on a dead job. Anything else stops without advancing, so
+    // the ids are retried next run. Treating it as terminal is how an expired token
+    // (401 on every job) walked the mark through two months of logs, saving none (#69).
+    if (!gh.ok && gh.status !== 404 && gh.status !== 410) {
+      stopped = `, stopped at job ${job} (HTTP ${gh.status})`;
+      break;
+    }
     if (gh.ok) {
       const log = await gh.text();
       await env.ARCHIVE.put(`logs/${universe}/${job}.txt`, log);
@@ -155,7 +160,7 @@ async function captureLogs(universe: string, env: Env): Promise<string> {
     mark = job;
   }
   if (mark > cursor) await env.ARCHIVE.put(`state/${universe}/logcursor`, JSON.stringify({ job: mark }));
-  return `${universe}: captured ${saved}/${ids.length} logs, cursor ${mark}`;
+  return `${universe}: captured ${saved}/${ids.length} logs, cursor ${mark}${stopped}`;
 }
 
 // ---------- check-log capture ----------
@@ -263,13 +268,15 @@ async function captureChecks(universe: string, env: Env): Promise<string> {
   const jobs = pendingArtifacts(await obs.json(), cursor, CHECKS_PER_RUN);
   if (!jobs.length) return `${universe}: check logs current at ${cursor}`;
 
-  let mark = cursor, saved = 0, empty = 0;
+  let mark = cursor, saved = 0, empty = 0, stopped = "";
   for (const { job, artifact } of jobs) {
     let logs: Record<string, string> | null;
     try {
       logs = await fetchCheckLogs(universe, artifact, token);
-    } catch {
-      break; // rate limited or transient: stop without advancing, retry next run
+    } catch (e) {
+      // Rate limited, transient or a bad token: stop without advancing, retry next run.
+      stopped = `, stopped at job ${job}: ${e}`;
+      break;
     }
     if (logs && Object.keys(logs).length) {
       await env.ARCHIVE.put(`checks/${universe}/${job}.json`, JSON.stringify(logs), {
@@ -285,7 +292,7 @@ async function captureChecks(universe: string, env: Env): Promise<string> {
   }
   if (mark > cursor)
     await env.ARCHIVE.put(`state/${universe}/checkcursor`, JSON.stringify({ job: mark }));
-  return `${universe}: captured ${saved} check logs${empty ? `, ${empty} unavailable` : ""}, cursor ${mark}`;
+  return `${universe}: captured ${saved} check logs${empty ? `, ${empty} unavailable` : ""}, cursor ${mark}${stopped}`;
 }
 
 // Capture is best-effort: a GitHub outage must not fail the poll it rides with,
@@ -1549,9 +1556,11 @@ const finish = (res: Response) => {
 // infer the type of a binding referenced inside its own initializer.
 const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<Response> } = {
   async scheduled(_ctrl: ScheduledController, env: Env, ctx: ExecutionContext) {
+    // Logged so Workers Logs shows each run's outcome; a capture that stalls or
+    // stops is otherwise invisible (#69).
     ctx.waitUntil(Promise.all([
       ...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env), ...backfill(env),
-    ]));
+    ]).then((r) => console.log(r.join("\n"))));
   },
   async fetch(req: Request, env: Env): Promise<Response> {
     return finish(await handler.route(req, env));
