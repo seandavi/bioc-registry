@@ -132,35 +132,42 @@ async function captureLogs(universe: string, env: Env): Promise<string> {
   let saved = 0;
   let stopped = "";
   for (const job of ids) {
-    const gh = await fetch(
-      `https://api.github.com/repos/r-universe/${universe}/actions/jobs/${job}/logs`,
-      { headers: { "user-agent": "bioc-registry", authorization: `Bearer ${token}` } }
-    );
-    // Only 404/410 (already expired upstream) is terminal; the mark passes those
-    // rather than wedging on a dead job. Anything else stops without advancing, so
-    // the ids are retried next run. Treating it as terminal is how an expired token
-    // (401 on every job) walked the mark through two months of logs, saving none (#69).
-    if (!gh.ok && gh.status !== 404 && gh.status !== 410) {
-      stopped = `, stopped at job ${job} (HTTP ${gh.status})`;
+    try {
+      if (await captureLog(universe, job, token, env)) saved++;
+    } catch (e) {
+      stopped = `, stopped at job ${job}: ${e}`;
       break;
-    }
-    if (gh.ok) {
-      const log = await gh.text();
-      await env.ARCHIVE.put(`logs/${universe}/${job}.txt`, log);
-      const manifest = buildManifest(log);
-      // Skipped when it found nothing: a log with no install section says nothing
-      // about the build, and an empty manifest would read as "no dependencies"
-      // rather than "not recorded".
-      if (manifest.image || Object.keys(manifest.deps).length)
-        await env.ARCHIVE.put(`builds/${universe}/${job}.json`, JSON.stringify(manifest), {
-          httpMetadata: { contentType: "application/json" },
-        });
-      saved++;
     }
     mark = job;
   }
   if (mark > cursor) await env.ARCHIVE.put(`state/${universe}/logcursor`, JSON.stringify({ job: mark }));
   return `${universe}: captured ${saved}/${ids.length} logs, cursor ${mark}${stopped}`;
+}
+
+// True when saved, false when the job is gone upstream. Throws when the walk should
+// stop and retry later.
+async function captureLog(universe: string, job: number, token: string, env: Env): Promise<boolean> {
+  const gh = await fetch(
+    `https://api.github.com/repos/r-universe/${universe}/actions/jobs/${job}/logs`,
+    { headers: ghHeaders(token) }
+  );
+  // Only 404/410 (already expired upstream) is terminal; callers move past those
+  // rather than wedging on a dead job. Anything else must stop the walk. Treating it
+  // as terminal is how an expired token (401 on every job) walked the mark through
+  // two months of logs, saving none (#69).
+  if (gh.status === 404 || gh.status === 410) return false;
+  if (!gh.ok) throw new Error(`HTTP ${gh.status}`);
+  const log = await gh.text();
+  await env.ARCHIVE.put(`logs/${universe}/${job}.txt`, log);
+  const manifest = buildManifest(log);
+  // Skipped when it found nothing: a log with no install section says nothing
+  // about the build, and an empty manifest would read as "no dependencies"
+  // rather than "not recorded".
+  if (manifest.image || Object.keys(manifest.deps).length)
+    await env.ARCHIVE.put(`builds/${universe}/${job}.json`, JSON.stringify(manifest), {
+      httpMetadata: { contentType: "application/json" },
+    });
+  return true;
 }
 
 // ---------- check-log capture ----------
@@ -270,23 +277,15 @@ async function captureChecks(universe: string, env: Env): Promise<string> {
 
   let mark = cursor, saved = 0, empty = 0, stopped = "";
   for (const { job, artifact } of jobs) {
-    let logs: Record<string, string> | null;
     try {
-      logs = await fetchCheckLogs(universe, artifact, token);
+      if (await captureCheck(universe, job, artifact, token, env)) saved++;
+      // Expired or artifact-less: unrecoverable, so let the mark move past it
+      // rather than wedging the cursor on a job that will never yield anything.
+      else empty++;
     } catch (e) {
       // Rate limited, transient or a bad token: stop without advancing, retry next run.
       stopped = `, stopped at job ${job}: ${e}`;
       break;
-    }
-    if (logs && Object.keys(logs).length) {
-      await env.ARCHIVE.put(`checks/${universe}/${job}.json`, JSON.stringify(logs), {
-        httpMetadata: { contentType: "application/json" },
-      });
-      saved++;
-    } else {
-      // Expired or artifact-less: unrecoverable, so let the mark move past it
-      // rather than wedging the cursor on a job that will never yield anything.
-      empty++;
     }
     mark = job;
   }
@@ -295,12 +294,62 @@ async function captureChecks(universe: string, env: Env): Promise<string> {
   return `${universe}: captured ${saved} check logs${empty ? `, ${empty} unavailable` : ""}, cursor ${mark}${stopped}`;
 }
 
+// Same contract as captureLog.
+async function captureCheck(
+  universe: string, job: number, artifact: string, token: string, env: Env
+): Promise<boolean> {
+  const logs = await fetchCheckLogs(universe, artifact, token);
+  if (!logs || !Object.keys(logs).length) return false;
+  await env.ARCHIVE.put(`checks/${universe}/${job}.json`, JSON.stringify(logs), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return true;
+}
+
+// ---------- requeue ----------
+// Both captures walk only the latest observation, so a job superseded by a rebuild
+// before capture reached it is never seen again. That cost ~92k jobs while the token
+// was dead (#69). state/{u}/requeue.json is a fixed list of [job, artifact|null]
+// pairs built offline from the jobs parquet (scripts/requeue.py); this drains it in
+// order, and state/{u}/requeuepos is how far it got. Remove once both are drained.
+// 150 jobs is ~300 GitHub calls a run per universe, which with the captures above
+// stays under 5,000/hr, and ~1,350 subrequests against the 10,000 limit.
+const REQUEUE_PER_RUN = 150;
+
+async function drainRequeue(universe: string, env: Env): Promise<string> {
+  const token = env.GITHUB_TOKEN?.trim();
+  if (!token) return `${universe}: requeue skipped (no GITHUB_TOKEN)`;
+  const q = await env.ARCHIVE.get(`state/${universe}/requeue.json`);
+  if (!q) return `${universe}: no requeue`;
+  const jobs = await q.json<[number, string | null][]>();
+  const p = await env.ARCHIVE.get(`state/${universe}/requeuepos`);
+  const start = p ? (await p.json<{ i: number }>()).i : 0;
+  if (start >= jobs.length) return `${universe}: requeue drained (${jobs.length})`;
+
+  let i = start, logs = 0, checks = 0, stopped = "";
+  for (; i < Math.min(jobs.length, start + REQUEUE_PER_RUN); i++) {
+    const [job, artifact] = jobs[i];
+    try {
+      // A stop after the log was saved retries the job whole; that rewrites the
+      // same log, which is cheaper than tracking the halves separately.
+      if (await captureLog(universe, job, token, env)) logs++;
+      if (artifact && (await captureCheck(universe, job, artifact, token, env))) checks++;
+    } catch (e) {
+      stopped = `, stopped at job ${job}: ${e}`;
+      break;
+    }
+  }
+  if (i > start) await env.ARCHIVE.put(`state/${universe}/requeuepos`, JSON.stringify({ i }));
+  return `${universe}: requeue ${logs} logs, ${checks} checks, ${i}/${jobs.length}${stopped}`;
+}
+
 // Capture is best-effort: a GitHub outage must not fail the poll it rides with,
 // and the cursors mean the skipped ids are simply picked up next run.
 const capture = (env: Env) =>
   UNIVERSES.flatMap((u) => [
     captureLogs(u, env).catch((e) => `${u}: capture failed: ${e}`),
     captureChecks(u, env).catch((e) => `${u}: check capture failed: ${e}`),
+    drainRequeue(u, env).catch((e) => `${u}: requeue failed: ${e}`),
   ]);
 
 // ---------- parquet ----------
