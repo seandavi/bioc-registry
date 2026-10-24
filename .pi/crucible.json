@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/seandavi/pi-crucible/main/schema/crucible.schema.json",
+  "design": "There is no separate design doc. README.md (how it works, the gate, seeds), docs/api.md and docs/DATAPLANE.md are the design; AGENTS.md has the rules. Architecture decisions live in seandavi/bioc-infrastructure (e.g. adr/0011-one-propagation-gate-for-every-producer.md); fetch with gh or curl if the issue touches one.",
+  "seamNote": "the gate (gate() in src/repo.ts), the index entry shape and storage keys (docs/DATAPLANE.md)",
+  "spec": {
+    "design": "the root cause with file:line evidence; files to change; any change to gate rules or GateConfig and which producers it affects; route, status code or content-type changes (each needs docs/api.md and src/openapi.ts); storage key or index-entry changes; user-facing text that must change to stay true; how many packages the change affects on the live data, measured from /data/prop/{u}/index.json and the latest observation"
+  },
+  "implement": "Run npm ci first in a fresh worktree. Pure logic belongs in src/repo.ts with an assertion in src/repo.test.ts; handlers and HTML in src/index.ts are not unit-tested. Tests never use the network. Never deploy or call side-effecting routes (/poll, /backfill, /reindex, /seed, /topup, /publish) on the live Worker; reading /data/* and /pkg/* there is fine.",
+  "checks": [
+    {
+      "name": "test",
+      "command": "npm test"
+    },
+    {
+      "name": "typecheck",
+      "command": "npx tsc -p . --noEmit 2>&1 | grep -E '^src/' && exit 1 || exit 0"
+    }
+  ],
+  "lenses": {
+    "code": "CODE review. Correctness against the issue and the spec; root cause fixed where every caller routes through (the gate is one function for every producer); tests that would actually catch a regression, without network; the docs rule (any route change updates docs/api.md and src/openapi.ts together); data-plane contract (storage keys, parquet schema, index entry shape) not silently renamed or removed; user-facing prose (package pages, dashboard, README, docs, code comments) still true after the change; smallest change that works, no new dependencies. The spec and the code must agree.",
+    "security": "SECURITY review. No secrets in code, fixtures, logs or responses; auth headers never forwarded to third-party redirect targets; side-effecting routes stay out of the OpenAPI spec; no route fetches a caller-supplied URL or host; input validation and bounds on path and query parameters; HTML output escaped (esc()); fork-PR CI safety.",
+    "ux": "UX review of what package maintainers and Bioconductor core see: package pages, the dashboard, /logs and /checks messages, API error bodies. Is every statement true for the package shown? Does a message say what happened and what to do next? Are links correct? Would a maintainer reading it file a bug report like issue #68?"
+  }
+}
