@@ -1509,7 +1509,7 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
     else if (rejectedRule(decision) === "version-gate")
       seededText = `${S} r-universe's current build (${esc(ver)}) is not newer than this seed (${esc(prop.version)}), so it is replaced only when r-universe builds a higher version that passes the gate.`;
     else
-      seededText = `${S.slice(0, -1)}: it builds in BBS and fails here. r-universe's current build (${esc(ver)}) fails the gate's ${esc(failed!.rule)} rule${failed!.detail ? ` (${esc(failed!.detail)})` : ""}. ${replacedBy}`;
+      seededText = `${S.slice(0, -1)}: it builds in BBS and fails here. r-universe's current build (${esc(ver)}) fails the gate's ${esc(failed!.rule)} rule${failed!.detail ? ` (${esc(failed!.detail)})` : ""}. It is replaced when r-universe builds a version newer than ${esc(prop.version)} that passes the gate.`;
   }
   const seededNote = seeded ? `<p class="warn">${seededText}</p>` : "";
 
