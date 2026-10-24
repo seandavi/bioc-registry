@@ -27,7 +27,9 @@ R version, wall time, links to the log proxy and the GHA job page), a
 newer-commit-failed banner when `_failure` is set, and the propagation index
 entry (propagated version, artifacts with download links, source repo, and —
 for a seeded entry — a banner saying it came from Bioconductor's release build
-rather than this gate). The history section
+rather than this gate, and what the gate makes of the package's current
+r-universe build: for example held by the version gate because r-universe builds
+the same version clean, or the rule it fails). The history section
 loads DuckDB-WASM in the browser and pivots the package's rows from every
 parquet observation into an observation × config check-status table.
 404 if the package is not in the latest observation.

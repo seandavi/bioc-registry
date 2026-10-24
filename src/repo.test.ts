@@ -780,6 +780,21 @@ test("gate: version-gate is strict; replace_seed lets bioc-build replace a bioco
   assert.match(d.reasons.find((r) => r.rule === "version-gate")!.detail!, /not > 0.52.0 \(bioc-build\)/);
 });
 
+test("gate: an r-universe build of a seeded version is held by version-gate alone, with its passing archs", () => {
+  const seeded = { BiocFileCache: { version: "3.2.0", sha256: "x", ts: "t", artifacts: [], origin: "bioconductor" as const } };
+  const jobs = [
+    { config: "source", r: "4.6.1", check: "OK" },
+    { config: "linux-release-x86_64", r: "4.6.1", check: "OK" },
+    { config: "windows-release-x86_64", r: "4.6.1", check: "OK" },
+    { config: "macos-release-arm64", r: "4.6.1", check: "OK" },
+  ];
+  const d = gate([cand({ package: "BiocFileCache", version: "3.2.0", origin: "r-universe", jobs })], GATE_CFG, seeded)
+    .decisions.BiocFileCache;
+  assert.equal(d.propagate, false);
+  assert.equal(rejectedRule(d), "version-gate");
+  assert.deepEqual(d.archs, ["linux", "win", "mac"]);
+});
+
 test("gate: families need a passing job on the gating R line; bioccheck is advisory unless configured", () => {
   const wrongR = cand({ jobs: [{ config: "linux-x86_64", r: "4.7.0", check: "OK" }] });
   assert.equal(rejectedRule(gate([wrongR], GATE_CFG, {}).decisions.msdata), "families");
