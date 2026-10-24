@@ -122,7 +122,9 @@ Every index entry therefore records an `origin`:
 
 Seeding is strictly additive — it only fills holes, and the version gate is
 untouched, so a seeded package is replaced the ordinary way: the maintainer bumps
-the version and r-universe builds it. The dashboard counts the two apart, and
+the version and r-universe builds it. Until then the seed stays even if
+r-universe later builds that same version clean; the package page says which case
+a package is in. The dashboard counts the two apart, and
 shows how many seeded entries the official repo has since moved past.
 
 ### What's stored

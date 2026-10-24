@@ -589,22 +589,36 @@ async function readIndex(env: Env, universe: string): Promise<PropIndex> {
   return o ? await o.json<PropIndex>() : {};
 }
 
+// The one config every r-universe wave gates with, and the package page reads
+// too (#68), so the page cannot drift from the wave. replace_seed stays false
+// (ADR 0011): a seed waits for a real version bump.
+const waveGateConfig = (gating_r: string): GateConfig =>
+  ({ gating_r, bioccheck: "advisory", replace_seed: false });
+
+// The question evaluate() asks of each observed package; the package page asks
+// it too, so its seed banner (#68) reads the same decision the wave made.
+function observedGateInput(p: FullPkg): GateInput | null {
+  // No source tarball means nothing to propagate, whatever the checks say.
+  if (!p.Package || !p.Version || !p._sha256) return null;
+  return {
+    package: p.Package, version: p.Version, origin: "r-universe",
+    build_status: p._status ?? "", jobs: p._jobs ?? [], desc: describe(p),
+  };
+}
+
 async function evaluate(env: Env, universe: string, obsKey: string, digest: string) {
   const obs = await env.ARCHIVE.get(obsKey);
   if (!obs) throw new Error(`missing observation ${obsKey}`);
   const pkgs = await obs.json<FullPkg[]>();
   const idx = await readIndex(env, universe);
-  const config: GateConfig = { gating_r: await gatingRMinor(universe), bioccheck: "advisory", replace_seed: false };
+  const config = waveGateConfig(await gatingRMinor(universe));
   const byName = new Map<string, FullPkg>();
   const inputs: GateInput[] = [];
   for (const p of pkgs) {
-    // No source tarball means nothing to propagate, whatever the checks say.
-    if (!p.Package || !p.Version || !p._sha256) continue;
-    byName.set(p.Package, p);
-    inputs.push({
-      package: p.Package, version: p.Version, origin: "r-universe",
-      build_status: p._status ?? "", jobs: p._jobs ?? [], desc: describe(p),
-    });
+    const input = observedGateInput(p);
+    if (!input) continue;
+    byName.set(p.Package!, p);
+    inputs.push(input);
   }
   const { decisions, approved } = gate(inputs, config, idx);
   const candidates: Candidate[] = approved.map((name) => {
@@ -1443,7 +1457,8 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
   if (!obs) return new Response("no observations yet", { status: 404 });
   const p = (await obs.json<FullPkg[]>()).find((x) => x.Package === name);
   if (!p) return new Response(`package ${name} not in latest ${universe} observation`, { status: 404 });
-  const prop = (await readIndex(env, universe))[name];
+  const idx = await readIndex(env, universe);
+  const prop = idx[name];
 
   const rows = [...(p._jobs ?? [])]
     .sort((a, b) => a.config.localeCompare(b.config))
@@ -1474,11 +1489,29 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
          : `<div class="tile"><b>${checkCell(prop.bioccheck ?? "—")}</b><span>bioccheck at prop</span></div>`}`
     : `<div class="tile"><b>—</b><span>not propagated</span></div>`;
 
-  const seededNote = seeded
-    ? `<p class="warn">This version was seeded from Bioconductor's own release build, not propagated
-       through this registry's gate: it builds in BBS and fails here. It is replaced the ordinary way,
-       when the maintainer bumps the version and r-universe builds it.</p>`
-    : "";
+  // A seed outlives the failure that made it: r-universe keeps rebuilding after
+  // /seed ran, so the banner reads the gate's verdict on the current build
+  // instead of repeating the claim that was true at seed time (#68).
+  const gatingR = seeded ? await gatingRMinor(universe).catch(() => null) : null;
+  const input = gatingR ? observedGateInput(p) : null;
+  const decision = input ? gate([input], waveGateConfig(gatingR!), idx).decisions[name] : null;
+  const S = "This version was seeded from Bioconductor's own release build, not propagated through this registry's gate.";
+  const replacedBy = "It is replaced the ordinary way, when the maintainer bumps the version and r-universe builds it.";
+  let seededText = "";
+  const ver = p.Version ?? "";
+  if (seeded) {
+    const failed = decision && !decision.propagate ? decision.reasons.find((q) => !q.ok) : undefined;
+    if (!decision) seededText = `${S} ${replacedBy}`;
+    else if (decision.propagate)
+      seededText = `${S} r-universe's build of ${esc(ver)} now passes the gate; the next propagation wave replaces this seed.`;
+    else if (rejectedRule(decision) === "version-gate" && ver === prop.version)
+      seededText = `${S} r-universe now builds this same version (${esc(ver)}) and its checks pass on ${esc(decision.archs.join(", "))}, but a version is published here only once, so the seeded copy stays until the maintainer bumps the version and r-universe builds the new one.`;
+    else if (rejectedRule(decision) === "version-gate")
+      seededText = `${S} r-universe's current build (${esc(ver)}) is not newer than this seed (${esc(prop.version)}), so it is replaced only when r-universe builds a higher version that passes the gate.`;
+    else
+      seededText = `${S.slice(0, -1)}: it builds in BBS and fails here. r-universe's current build (${esc(ver)}) fails the gate's ${esc(failed!.rule)} rule${failed!.detail ? ` (${esc(failed!.detail)})` : ""}. It is replaced when r-universe builds a version newer than ${esc(prop.version)} that passes the gate.`;
+  }
+  const seededNote = seeded ? `<p class="warn">${seededText}</p>` : "";
 
   // Labelled a mirror because it is one: PRs against github.com/bioc/* go nowhere.
   const src = prop?.meta?.git_url
@@ -1909,7 +1942,9 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       // since it turns into a hit as soon as capture reaches that job.
       if (obj) return new Response(obj.body, { headers: { ...text, "cache-control": IMMUTABLE } });
       return new Response(
-        `log not captured (capture only walks forward from when it was switched on).\n` +
+        `log not captured. Capture walks forward through job ids on the cron, so a recent job\n` +
+          `can take a few runs to arrive, and jobs missed during a capture outage are drained\n` +
+          `from a backlog; a job GitHub deleted (~90 days) before capture reached it is gone.\n` +
           `While GHA still has it: https://github.com/r-universe/${u}/runs/${job}\n`,
         { status: 404, headers: text }
       );
