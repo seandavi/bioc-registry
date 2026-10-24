@@ -664,9 +664,10 @@ export type GateInput = {
 export type GateConfig = {
   gating_r: string;                    // R minor the gating jobs must run on
   bioccheck: "advisory" | "blocking";
-  // bioc-build may replace a bioconductor-seeded entry at the same version
-  // (SPEC-014: a seed is not a verdict, our build of it is). r-universe never
-  // re-publishes a version, so a seed there waits for a real bump.
+  // A passing build may replace a bioconductor-seeded entry at the same version
+  // (SPEC-014: a seed is not a verdict, our build of it is). Both producers set
+  // it: r-universe rebuilds an unchanged version (issue #68), so without it a
+  // seed outlives a passing build until the maintainer bumps.
   replace_seed: boolean;
 };
 export type Reason = { rule: string; ok: boolean; detail?: string };

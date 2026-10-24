@@ -594,7 +594,7 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
   if (!obs) throw new Error(`missing observation ${obsKey}`);
   const pkgs = await obs.json<FullPkg[]>();
   const idx = await readIndex(env, universe);
-  const config: GateConfig = { gating_r: await gatingRMinor(universe), bioccheck: "advisory", replace_seed: false };
+  const config: GateConfig = { gating_r: await gatingRMinor(universe), bioccheck: "advisory", replace_seed: true };
   const byName = new Map<string, FullPkg>();
   const inputs: GateInput[] = [];
   for (const p of pkgs) {
@@ -817,7 +817,7 @@ async function topUpSeeds(env: Env, universe: string, limit = TOPUP_LIMIT): Prom
 // examples/tests, one a real compile failure). Seeding is strictly additive —
 // it only ever fills a hole, never displaces or blocks a propagated entry, and
 // the version gate is untouched, so a seeded package is replaced the ordinary
-// way: the maintainer bumps the version and r-universe builds it.
+// way: r-universe builds it, at the same version or a newer one, and it passes.
 
 const BIOC_BRANCH: Record<string, string> = { bioc: "devel", "bioc-release": "release" };
 const SEED_BATCH = 10;
@@ -1476,8 +1476,8 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
 
   const seededNote = seeded
     ? `<p class="warn">This version was seeded from Bioconductor's own release build, not propagated
-       through this registry's gate: it builds in BBS and fails here. It is replaced the ordinary way,
-       when the maintainer bumps the version and r-universe builds it.</p>`
+       through this registry's gate: it had not passed here when it was seeded. It is replaced as soon
+       as r-universe builds this version or a newer one and the build passes the gate.</p>`
     : "";
 
   // Labelled a mirror because it is one: PRs against github.com/bioc/* go nowhere.

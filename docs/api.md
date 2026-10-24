@@ -298,8 +298,8 @@ Additive: it fills holes, and repairs entries that are in the index but invisibl
 it cannot be installed by name and nothing outside can tell it exists. Such an
 entry is replaced by a described, installable one, never by an older version. A
 package with a real gate verdict keeps it, so `/seed` can never displace or block
-a propagated package. The version gate is untouched — a seeded package is replaced
-the ordinary way, when its maintainer bumps the version and r-universe builds it.
+a propagated package. A seeded package is replaced by the first build that passes the
+gate, from r-universe or bioc-build, at the same version or a newer one.
 
 Seeded entries carry `"origin": "bioconductor"`, an empty `archs`, and a null
 `bioccheck`, because they never faced the gate.
