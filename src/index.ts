@@ -9,7 +9,7 @@ import {
   invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
   viewsDcf, writeOnce, JobRow, RowState,
   validatePublish, upsertEntry, mergeAttempt, AttemptRecord,
-  gate, rejectedRule, R_VER, GateConfig, GateInput, GateManifest, gateInputFromStaged,
+  gate, rejectedRule, R_VER, waveGateConfig, GateConfig, GateInput, GateManifest, gateInputFromStaged,
   binaryArtifacts, topUpBinaries, seedBinaryTopUp, GATE_FAMILIES,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
@@ -589,12 +589,6 @@ async function readIndex(env: Env, universe: string): Promise<PropIndex> {
   return o ? await o.json<PropIndex>() : {};
 }
 
-// The one config every r-universe wave gates with, and the package page reads
-// too (#68), so the page cannot drift from the wave. replace_seed stays false
-// (ADR 0011): a seed waits for a real version bump.
-const waveGateConfig = (gating_r: string): GateConfig =>
-  ({ gating_r, bioccheck: "advisory", replace_seed: false });
-
 // The question evaluate() asks of each observed package; the package page asks
 // it too, so its seed banner (#68) reads the same decision the wave made.
 function observedGateInput(p: FullPkg): GateInput | null {
@@ -643,10 +637,11 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
   const pendingKey = `prop/${universe}/pending/${digest.slice(0, 12)}.json`;
   await env.ARCHIVE.put(pendingKey, JSON.stringify(candidates));
   // "Why has X not propagated?" — answered from the archive, not by re-deriving.
-  // Only versions that ARE new (version-gate passed) and still failed: the
-  // steady state is every package sitting at its published version, and
-  // listing all of those every wave is noise, not a record. A blocked candidate
-  // is reconsidered on every later wave and lands as soon as its blocker does.
+  // Only versions the version gate lets in (new, or replacing a seed) that
+  // still failed: the steady state is every package sitting at its published
+  // version, and listing all of those every wave is noise, not a record. A
+  // blocked candidate is reconsidered on every later wave and lands as soon as
+  // its blocker does.
   const blocked = Object.entries(decisions)
     .filter(([, d]) => !d.propagate && d.reasons.some((r) => r.rule === "version-gate" && r.ok))
     .map(([name, d]) => ({ package: name, version: byName.get(name)!.Version, reasons: d.reasons }));
@@ -829,9 +824,9 @@ async function topUpSeeds(env: Env, universe: string, limit = TOPUP_LIMIT): Prom
 // in BBS and fail in r-universe's environment, mostly on external services their
 // examples reach (measured: 13 of 14 sampled failures were network errors inside
 // examples/tests, one a real compile failure). Seeding is strictly additive —
-// it only ever fills a hole, never displaces or blocks a propagated entry, and
-// the version gate is untouched, so a seeded package is replaced the ordinary
-// way: the maintainer bumps the version and r-universe builds it.
+// it only ever fills a hole, never displaces or blocks a propagated entry — and
+// a seed is replaced the first time an r-universe build of that version, or a
+// newer one, passes the gate (#78).
 
 const BIOC_BRANCH: Record<string, string> = { bioc: "devel", "bioc-release": "release" };
 const SEED_BATCH = 10;
@@ -1496,7 +1491,7 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
   const input = gatingR ? observedGateInput(p) : null;
   const decision = input ? gate([input], waveGateConfig(gatingR!), idx).decisions[name] : null;
   const S = "This version was seeded from Bioconductor's own release build, not propagated through this registry's gate.";
-  const replacedBy = "It is replaced the ordinary way, when the maintainer bumps the version and r-universe builds it.";
+  const replacedBy = "It is replaced the first time an r-universe build of this version, or a newer one, passes the gate.";
   let seededText = "";
   const ver = p.Version ?? "";
   if (seeded) {
@@ -1504,12 +1499,10 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
     if (!decision) seededText = `${S} ${replacedBy}`;
     else if (decision.propagate)
       seededText = `${S} r-universe's build of ${esc(ver)} now passes the gate; the next propagation wave replaces this seed.`;
-    else if (rejectedRule(decision) === "version-gate" && ver === prop.version)
-      seededText = `${S} r-universe now builds this same version (${esc(ver)}) and its checks pass on ${esc(decision.archs.join(", "))}, but a version is published here only once, so the seeded copy stays until the maintainer bumps the version and r-universe builds the new one.`;
     else if (rejectedRule(decision) === "version-gate")
-      seededText = `${S} r-universe's current build (${esc(ver)}) is not newer than this seed (${esc(prop.version)}), so it is replaced only when r-universe builds a higher version that passes the gate.`;
+      seededText = `${S} r-universe's current build (${esc(ver)}) is not newer than this seed (${esc(prop.version)}), so it is replaced when r-universe builds ${esc(prop.version)} or a newer version and that build passes the gate.`;
     else
-      seededText = `${S.slice(0, -1)}: it builds in BBS and fails here. r-universe's current build (${esc(ver)}) fails the gate's ${esc(failed!.rule)} rule${failed!.detail ? ` (${esc(failed!.detail)})` : ""}. It is replaced when r-universe builds a version newer than ${esc(prop.version)} that passes the gate.`;
+      seededText = `${S.slice(0, -1)}: it builds in BBS and fails here. r-universe's current build (${esc(ver)}) fails the gate's ${esc(failed!.rule)} rule${failed!.detail ? ` (${esc(failed!.detail)})` : ""}. It is replaced as soon as an r-universe build of ${esc(prop.version)}, or of a newer version, passes the gate.`;
   }
   const seededNote = seeded ? `<p class="warn">${seededText}</p>` : "";
 

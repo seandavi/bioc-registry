@@ -664,11 +664,19 @@ export type GateInput = {
 export type GateConfig = {
   gating_r: string;                    // R minor the gating jobs must run on
   bioccheck: "advisory" | "blocking";
-  // bioc-build may replace a bioconductor-seeded entry at the same version
-  // (SPEC-014: a seed is not a verdict, our build of it is). r-universe never
-  // re-publishes a version, so a seed there waits for a real bump.
+  // A same-version build may replace a bioconductor-seeded entry, once: the
+  // replacement's origin is no longer "bioconductor" (SPEC-014: a seed is not a
+  // verdict, our build of it is). r-universe waves and POST /publish set it;
+  // POST /gate defaults it off.
   replace_seed: boolean;
 };
+
+// The one config every r-universe wave gates with; the package page reads it
+// too (#68), so the page cannot drift from the wave. replace_seed is true
+// (#78): r-universe does rebuild a version it already published, and a seed is
+// not a verdict, a passing build of it is (SPEC-014), whichever producer built it.
+export const waveGateConfig = (gating_r: string): GateConfig =>
+  ({ gating_r, bioccheck: "advisory", replace_seed: true });
 export type Reason = { rule: string; ok: boolean; detail?: string };
 export type Decision = { propagate: boolean; archs: Family[]; reasons: Reason[] };
 

@@ -89,7 +89,7 @@ flowchart TD
   A["_status == success"] -->|no| X["not propagated"]
   A -->|yes| B{"checks pass on<br/>linux, win, or mac?<br/><i>NOTE/WARNING pass<br/>ERROR/FAIL block</i>"}
   B -->|none| X
-  B -->|"≥ 1 family"| C{"version is a strict<br/>bump over the<br/>propagated one?"}
+  B -->|"≥ 1 family"| C{"version is a strict<br/>bump over the<br/>propagated one, or<br/>replaces a seed?"}
   C -->|no| X
   C -->|yes| D["propagate:<br/>source always,<br/>binaries for passing<br/>families only"]
   D --> E[("index.json + CAS")]
@@ -120,11 +120,10 @@ Every index entry therefore records an `origin`:
 | `r-universe` | passed the gate above; `archs` says which platforms |
 | `bioconductor` | seeded from Bioconductor's own release build; never faced this gate, so `archs` is empty and `bioccheck` is null |
 
-Seeding is strictly additive — it only fills holes, and the version gate is
-untouched, so a seeded package is replaced the ordinary way: the maintainer bumps
-the version and r-universe builds it. Until then the seed stays even if
-r-universe later builds that same version clean; the package page says which case
-a package is in. The dashboard counts the two apart, and
+Seeding is strictly additive — it only fills holes. A seed is not a verdict, so
+it is replaced the first time r-universe builds that version, or a newer one,
+and the build passes the gate; until then the package page says what stands in
+the way. The dashboard counts the two apart, and
 shows how many seeded entries the official repo has since moved past.
 
 ### What's stored

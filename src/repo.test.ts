@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approveByDeps, binaryArtifacts, seedBinaryTopUp, topUpBinaries, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, writeOnce } from "./repo.ts";
+import { approveByDeps, binaryArtifacts, seedBinaryTopUp, topUpBinaries, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, waveGateConfig, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -780,7 +780,7 @@ test("gate: version-gate is strict; replace_seed lets bioc-build replace a bioco
   assert.match(d.reasons.find((r) => r.rule === "version-gate")!.detail!, /not > 0.52.0 \(bioc-build\)/);
 });
 
-test("gate: an r-universe build of a seeded version is held by version-gate alone, with its passing archs", () => {
+test("gate: the r-universe wave config lets a passing same-version build replace a seed, once", () => {
   const seeded = { BiocFileCache: { version: "3.2.0", sha256: "x", ts: "t", artifacts: [], origin: "bioconductor" as const } };
   const jobs = [
     { config: "source", r: "4.6.1", check: "OK" },
@@ -788,11 +788,16 @@ test("gate: an r-universe build of a seeded version is held by version-gate alon
     { config: "windows-release-x86_64", r: "4.6.1", check: "OK" },
     { config: "macos-release-arm64", r: "4.6.1", check: "OK" },
   ];
-  const d = gate([cand({ package: "BiocFileCache", version: "3.2.0", origin: "r-universe", jobs })], GATE_CFG, seeded)
-    .decisions.BiocFileCache;
-  assert.equal(d.propagate, false);
-  assert.equal(rejectedRule(d), "version-gate");
+  const c = cand({ package: "BiocFileCache", version: "3.2.0", origin: "r-universe", jobs });
+  const d = gate([c], waveGateConfig("4.6"), seeded).decisions.BiocFileCache;
+  assert.equal(d.propagate, true);
   assert.deepEqual(d.archs, ["linux", "win", "mac"]);
+  // propagateBatch rewrites the entry with origin r-universe; the next wave at
+  // the same version must not propagate it again.
+  const replaced = { BiocFileCache: { ...seeded.BiocFileCache, origin: "r-universe" as const } };
+  const again = gate([c], waveGateConfig("4.6"), replaced).decisions.BiocFileCache;
+  assert.equal(again.propagate, false);
+  assert.equal(rejectedRule(again), "version-gate");
 });
 
 test("gate: families need a passing job on the gating R line; bioccheck is advisory unless configured", () => {
