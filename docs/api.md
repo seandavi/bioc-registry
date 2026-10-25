@@ -28,8 +28,8 @@ newer-commit-failed banner when `_failure` is set, and the propagation index
 entry (propagated version, artifacts with download links, source repo, and —
 for a seeded entry — a banner saying it came from Bioconductor's release build
 rather than this gate, and what the gate makes of the package's current
-r-universe build: for example held by the version gate because r-universe builds
-the same version clean, or the rule it fails). The history section
+r-universe build: for example that the next propagation wave replaces the
+seed because r-universe's build now passes, or the rule it fails). The history section
 loads DuckDB-WASM in the browser and pivots the package's rows from every
 parquet observation into an observation × config check-status table.
 404 if the package is not in the latest observation.
@@ -300,8 +300,9 @@ Additive: it fills holes, and repairs entries that are in the index but invisibl
 it cannot be installed by name and nothing outside can tell it exists. Such an
 entry is replaced by a described, installable one, never by an older version. A
 package with a real gate verdict keeps it, so `/seed` can never displace or block
-a propagated package. The version gate is untouched — a seeded package is replaced
-the ordinary way, when its maintainer bumps the version and r-universe builds it.
+a propagated package. A seeded package is replaced the first time an
+r-universe build of that version, or a newer one, passes the gate: r-universe
+waves gate with `replace_seed: true`, as `POST /publish` does.
 
 Seeded entries carry `"origin": "bioconductor"`, an empty `archs`, and a null
 `bioccheck`, because they never faced the gate.
@@ -456,7 +457,8 @@ Body:
 `manifest` is optional: absent, the manifest rules do not run (r-universe);
 `null` means "lookup failed". `config` is optional; `gating_r` defaults to the
 R line bioconductor.org's `config.yaml` maps the universe to, `bioccheck` to
-`advisory`, `replace_seed` to `false`. Up to 500 candidates; the `deps` rule is a
+`advisory`, `replace_seed` to `false` (r-universe waves and `POST /publish` both gate with
+`true`, so pass it to ask what a wave would do with a seeded package). Up to 500 candidates; the `deps` rule is a
 fixpoint over the whole set, so a coordinated bump can be asked about together.
 
 Response:
