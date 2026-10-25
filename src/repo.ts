@@ -666,8 +666,8 @@ export type GateConfig = {
   bioccheck: "advisory" | "blocking";
   // A same-version build may replace a bioconductor-seeded entry, once: the
   // replacement's origin is no longer "bioconductor" (SPEC-014: a seed is not a
-  // verdict, our build of it is). r-universe waves and POST /publish set it;
-  // POST /gate defaults it off.
+  // verdict, our build of it is). r-universe waves and POST /publish set it,
+  // and POST /gate defaults to it so the read-only answer matches them.
   replace_seed: boolean;
 };
 

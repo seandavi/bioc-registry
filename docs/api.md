@@ -46,7 +46,9 @@ It does not contain R CMD check's verdict — for that see
 
 Capture runs on the cron (`captureLogs`), 200 jobs per run, walking forward from
 a high-water mark in `state/{universe}/logcursor`. It only captures jobs seen
-after it was switched on; anything older 404s here with a link to GHA. Capture
+after it was switched on; anything older 404s here with a link to GHA, as does a
+recent job capture has not reached yet or missed during an outage (those are
+drained from a backlog, `state/{universe}/requeue.json`). Capture
 no-ops entirely without the `GITHUB_TOKEN` worker secret — GitHub returns 403
 for unauthenticated log downloads, though job *metadata* is public.
 
@@ -457,8 +459,9 @@ Body:
 `manifest` is optional: absent, the manifest rules do not run (r-universe);
 `null` means "lookup failed". `config` is optional; `gating_r` defaults to the
 R line bioconductor.org's `config.yaml` maps the universe to, `bioccheck` to
-`advisory`, `replace_seed` to `false` (r-universe waves and `POST /publish` both gate with
-`true`, so pass it to ask what a wave would do with a seeded package). Up to 500 candidates; the `deps` rule is a
+`advisory`, `replace_seed` to `true`, matching r-universe waves and `POST /publish`
+(pass `false` to ask whether a candidate clears the version gate without
+replacing a same-version seed). Up to 500 candidates; the `deps` rule is a
 fixpoint over the whole set, so a coordinated bump can be asked about together.
 
 Response:
