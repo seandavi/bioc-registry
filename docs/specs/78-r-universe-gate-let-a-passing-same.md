@@ -138,6 +138,9 @@ describe the new behaviour.
      `` It is replaced as soon as an r-universe build of ${esc(prop.version)}, or of a newer version, passes the gate. ``
      The rest of that string, including "it builds in BBS and fails here", stays.
    - Keep the comment above the banner (`:1492-1494`) as it is. It is still true.
+5. Dashboard "why are packages not propagated?" list, rule 3 (`src/index.ts:1291`):
+   `<li>The version is a strict bump over the version already propagated, or the same version as a Bioconductor seed it replaces.</li>`.
+   Same wording as README mermaid node C.
 
 **`src/repo.test.ts`**
 

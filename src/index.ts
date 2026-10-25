@@ -1288,7 +1288,7 @@ function universeHtml(s: Summary, now: number): string {
         (<code>NOTE</code> and <code>WARNING</code> pass). Gating jobs run R ${esc(s.rMinor)}.x on:
         <code>source</code> + linux x86_64, windows x86_64, macOS arm64 — matching what production BBS
         tests.</li>
-      <li>The version is a strict bump over the version already propagated.</li>
+      <li>The version is a strict bump over the version already propagated, or the same version as a Bioconductor seed it replaces.</li>
     </ol>
     <p><b>Only the passing architectures propagate.</b> The source tarball always rides with an eligible
       package; binaries for a failing architecture are simply not available until a later version passes
