@@ -256,7 +256,8 @@ export const OPENAPI = {
           "The GitHub Actions job log, served from our archive rather than proxied. Job ids " +
           "come from `_jobs[].job` in an observation, or from the package page.\n\n" +
           "Capture walks forward from when it was switched on, so jobs older than that are " +
-          "404 here — GitHub deletes them at ~90 days, which is the reason for capturing at all.",
+          "404 here, as are recent jobs capture has not reached yet or missed during an outage " +
+          "(drained from a backlog). GitHub deletes logs at ~90 days, which is the reason for capturing at all.",
         parameters: [
           UNIVERSE,
           { name: "job", in: "path", required: true, schema: { type: "string", pattern: "^\\d+$", example: "93666921965" } },
@@ -278,8 +279,9 @@ export const OPENAPI = {
           "failing section), `00install.out` (that platform's build log), `*-Ex.Rout` (the " +
           "example transcript, `.fail` when examples errored) and `tests/*.Rout`; on the " +
           "`bioc-checks` config, `00BiocCheck.log` and `output.log`; on wasm, `build.log`.\n\n" +
-          "Capture walks forward from when it was switched on, and the upstream artifacts " +
-          "expire at ~100 days, so anything older is 404 here permanently.",
+          "Capture walks forward from when it was switched on, so older jobs are 404 here, as are " +
+          "recent jobs capture has not reached yet or missed during an outage (drained from a backlog). " +
+          "The upstream artifacts expire at ~100 days, so a job that expired first is 404 here permanently.",
         parameters: [
           UNIVERSE,
           { name: "job", in: "path", required: true, schema: { type: "string", pattern: "^\\d+$", example: "91651624895" } },

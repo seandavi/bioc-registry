@@ -611,7 +611,7 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
   for (const p of pkgs) {
     const input = observedGateInput(p);
     if (!input) continue;
-    byName.set(p.Package!, p);
+    byName.set(input.package, p);
     inputs.push(input);
   }
   const { decisions, approved } = gate(inputs, config, idx);
@@ -1490,8 +1490,8 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
   const gatingR = seeded ? await gatingRMinor(universe).catch(() => null) : null;
   const input = gatingR ? observedGateInput(p) : null;
   const decision = input ? gate([input], waveGateConfig(gatingR!), idx).decisions[name] : null;
-  const S = "This version was seeded from Bioconductor's own release build, not propagated through this registry's gate.";
-  const replacedBy = "It is replaced the first time an r-universe build of this version, or a newer one, passes the gate.";
+  const S = `This version was seeded from Bioconductor's own ${BIOC_BRANCH[universe]} build, not propagated through this registry's gate.`;
+  const replacedBy = prop ? `It is replaced the first time an r-universe build of ${esc(prop.version)}, or a newer version, passes the gate.` : "";
   let seededText = "";
   const ver = p.Version ?? "";
   if (seeded) {
@@ -1500,7 +1500,7 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
     else if (decision.propagate)
       seededText = `${S} r-universe's build of ${esc(ver)} now passes the gate; the next propagation wave replaces this seed.`;
     else if (rejectedRule(decision) === "version-gate")
-      seededText = `${S} r-universe's current build (${esc(ver)}) is not newer than this seed (${esc(prop.version)}), so it is replaced when r-universe builds ${esc(prop.version)} or a newer version and that build passes the gate.`;
+      seededText = `${S} r-universe's current build (${esc(ver)}) is not newer than this seed (${esc(prop.version)}), so the seed is replaced when r-universe builds ${esc(prop.version)} or a newer version and that build passes the gate.`;
     else
       seededText = `${S.slice(0, -1)}: it builds in BBS and fails here. r-universe's current build (${esc(ver)}) fails the gate's ${esc(failed!.rule)} rule${failed!.detail ? ` (${esc(failed!.detail)})` : ""}. It is replaced as soon as an r-universe build of ${esc(prop.version)}, or of a newer version, passes the gate.`;
   }
@@ -1764,7 +1764,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       const config: GateConfig = {
         gating_r: body.config?.gating_r ?? await gatingRMinor(body.universe!),
         bioccheck: body.config?.bioccheck ?? "advisory",
-        replace_seed: body.config?.replace_seed ?? false,
+        replace_seed: body.config?.replace_seed ?? true,
       };
       const idx = await readIndex(env, body.universe!);
       const inputs: GateInput[] = body.candidates.map((c) => ({
@@ -1955,7 +1955,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       return new Response(
         JSON.stringify({
           error: "not captured",
-          detail: "capture walks forward from when it was switched on; artifacts expire upstream at ~100 days",
+          detail: "capture walks forward through job ids on the cron, so a recent job can take a few runs to arrive, and jobs missed during a capture outage are drained from a backlog; artifacts expire upstream at ~100 days, so a job that expired before capture reached it is gone",
           job: `https://github.com/r-universe/${u}/runs/${job}`,
         }),
         { status: 404, headers: json }
