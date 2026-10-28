@@ -462,7 +462,10 @@ R line bioconductor.org's `config.yaml` maps the universe to, `bioccheck` to
 `advisory`, `replace_seed` to `true`, matching r-universe waves and `POST /publish`
 (pass `false` to ask whether a candidate clears the version gate without
 replacing a same-version seed). Up to 500 candidates; the `deps` rule is a
-fixpoint over the whole set, so a coordinated bump can be asked about together.
+fixpoint over the whole set, so a coordinated bump can be asked about together. A hard
+dependency (Depends, Imports, LinkingTo) on a package published neither here
+nor by CRAN or Bioconductor's data, workflow and book repositories fails `deps`:
+the candidate could not be installed. Those names are refreshed daily.
 
 Response:
 

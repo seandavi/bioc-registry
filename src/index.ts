@@ -9,7 +9,7 @@ import {
   invisible, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt,
   viewsDcf, writeOnce, JobRow, RowState,
   validatePublish, upsertEntry, mergeAttempt, AttemptRecord,
-  gate, rejectedRule, R_VER, waveGateConfig, GateConfig, GateInput, GateManifest, gateInputFromStaged,
+  gate, packageNames, rejectedRule, R_VER, waveGateConfig, GateConfig, GateInput, GateManifest, gateInputFromStaged,
   binaryArtifacts, topUpBinaries, seedBinaryTopUp, GATE_FAMILIES,
 } from "./repo.js";
 import { DOCS_PAGE, OPENAPI } from "./openapi.js";
@@ -564,12 +564,16 @@ async function gitUrls(universe: string): Promise<Record<string, string>> {
   return parseGitmodules(await res.text());
 }
 
-async function gatingRMinor(universe: string): Promise<string> {
+async function biocConfig(universe: string): Promise<{ y: string; biocVer: string | undefined }> {
   const res = await fetch("https://bioconductor.org/config.yaml");
   if (!res.ok) throw new Error(`config.yaml: HTTP ${res.status}`);
   const y = await res.text();
   const branch = universe === "bioc" ? "devel" : "release";
-  const biocVer = y.match(new RegExp(`^${branch}_version: "([\\d.]+)"`, "m"))?.[1];
+  return { y, biocVer: y.match(new RegExp(`^${branch}_version: "([\\d.]+)"`, "m"))?.[1] };
+}
+
+async function gatingRMinor(universe: string): Promise<string> {
+  const { y, biocVer } = await biocConfig(universe);
   const rMinor =
     biocVer && y.split("r_ver_for_bioc_ver:")[1]?.match(new RegExp(`"${biocVer}": "(\\d+\\.\\d+)"`))?.[1];
   if (!rMinor) throw new Error(`cannot resolve gating R version for ${universe} (bioc ${biocVer})`);
@@ -583,6 +587,45 @@ type Candidate = {
   bioccheck: string | null; artifacts: Artifact[]; desc: Desc; meta: Meta;
   archs: Family[];
 };
+
+// ---------- names published outside the index (#56) ----------
+// The deps rule blocks a hard dependency nobody publishes, which needs the names
+// CRAN and Bioconductor's data, workflow and book repositories publish (books:
+// OSCA.basic depends on OSCA.workflows). CRAN's PACKAGES is ~7 MB and
+// the package page gates too, so the names are fetched on the cron at most once
+// a day and every gate() caller reads the stored set. All-or-nothing: a partial
+// set would block whatever the missing source holds, so a failed source keeps
+// the previous set (and with none, the rule falls back to passing unknowns).
+const KNOWN_DEPS_MAX_AGE_MS = 24 * 3600 * 1000;
+const knownDepsKey = (universe: string) => `prop/${universe}/known-deps.json`;
+
+async function refreshKnownDeps(universe: string, env: Env): Promise<string> {
+  const head = await env.ARCHIVE.head(knownDepsKey(universe));
+  if (head && Date.now() - head.uploaded.getTime() < KNOWN_DEPS_MAX_AGE_MS) return `${universe}: known deps fresh`;
+  const { biocVer } = await biocConfig(universe);
+  if (!biocVer) throw new Error(`no Bioconductor version for ${universe}`);
+  const urls = [
+    "https://cloud.r-project.org/src/contrib/PACKAGES",
+    ...["data/annotation", "data/experiment", "workflows", "books"].map(
+      (r) => `https://bioconductor.org/packages/${biocVer}/${r}/src/contrib/PACKAGES`
+    ),
+  ];
+  const names = new Set<string>();
+  for (const url of urls) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+    const got = packageNames(await res.text());
+    if (!got.length) throw new Error(`${url}: no packages`);
+    got.forEach((n) => names.add(n));
+  }
+  await env.ARCHIVE.put(knownDepsKey(universe), JSON.stringify({ sources: urls, names: [...names].sort() }));
+  return `${universe}: known deps refreshed, ${names.size} names`;
+}
+
+async function readKnownDeps(env: Env, universe: string): Promise<Set<string> | undefined> {
+  const o = await env.ARCHIVE.get(knownDepsKey(universe));
+  return o ? new Set((await o.json<{ names: string[] }>()).names) : undefined;
+}
 
 async function readIndex(env: Env, universe: string): Promise<PropIndex> {
   const o = await env.ARCHIVE.get(`prop/${universe}/index.json`);
@@ -614,7 +657,7 @@ async function evaluate(env: Env, universe: string, obsKey: string, digest: stri
     byName.set(input.package, p);
     inputs.push(input);
   }
-  const { decisions, approved } = gate(inputs, config, idx);
+  const { decisions, approved } = gate(inputs, config, idx, await readKnownDeps(env, universe));
   const candidates: Candidate[] = approved.map((name) => {
     const p = byName.get(name)!;
     const archs = decisions[name].archs;
@@ -1489,7 +1532,9 @@ async function pkgPage(env: Env, universe: string, name: string, now: number): P
   // instead of repeating the claim that was true at seed time (#68).
   const gatingR = seeded ? await gatingRMinor(universe).catch(() => null) : null;
   const input = gatingR ? observedGateInput(p) : null;
-  const decision = input ? gate([input], waveGateConfig(gatingR!), idx).decisions[name] : null;
+  const decision = input
+    ? gate([input], waveGateConfig(gatingR!), idx, await readKnownDeps(env, universe)).decisions[name]
+    : null;
   const S = `This version was seeded from Bioconductor's own ${BIOC_BRANCH[universe]} build, not propagated through this registry's gate.`;
   const replacedBy = prop ? `It is replaced the first time an r-universe build of ${esc(prop.version)}, or a newer version, passes the gate.` : "";
   let seededText = "";
@@ -1635,6 +1680,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
     // stops is otherwise invisible (#69).
     ctx.waitUntil(Promise.all([
       ...UNIVERSES.map((u) => poll(u, env)), ...capture(env), ...compact(env), ...backfill(env),
+      ...UNIVERSES.map((u) => refreshKnownDeps(u, env).catch((e) => `${u}: known deps refresh failed: ${e}`)),
     ]).then((r) => console.log(r.join("\n"))));
   },
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -1704,7 +1750,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
             gating_r: (staged.build.r_version ?? "").split(".").slice(0, 2).join("."),
             bioccheck: "advisory", replace_seed: true,
           };
-          decision = gate([input], config, await readIndex(env, universe)).decisions[pkg];
+          decision = gate([input], config, await readIndex(env, universe), await readKnownDeps(env, universe)).decisions[pkg];
           if (!decision.propagate) {
             await recordAttempt(`rejected:${rejectedRule(decision)}`);
             return json({ ok: true, propagate: false, changed: false, decision });
@@ -1770,7 +1816,7 @@ const handler: ExportedHandler<Env> & { route(req: Request, env: Env): Promise<R
       const inputs: GateInput[] = body.candidates.map((c) => ({
         ...c, origin: c.origin ?? "r-universe", build_status: c.build_status ?? "success", desc: c.desc ?? {},
       }));
-      return json({ config, ...gate(inputs, config, idx) });
+      return json({ config, ...gate(inputs, config, idx, await readKnownDeps(env, body.universe!)) });
     }
     if (pathname.startsWith("/data/")) {
       const key = decodeURIComponent(pathname.slice(6));

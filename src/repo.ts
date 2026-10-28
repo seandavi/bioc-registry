@@ -577,10 +577,14 @@ export function depConstraints(d: Desc): DepReq[] {
 // A candidate may propagate only if every hard dependency WE publish is present
 // at a version its constraint accepts. Dependencies we do not publish — CRAN,
 // and the annotation/experiment data packages that have no build home until M2 —
-// pass untouched: we cannot vouch for them either way, and blocking on them
-// would strand well over half the universe (the canary measures ~1050 of 2391
-// with a fully resolvable closure). This is Hervé's "no propagations that
-// introduce impossible dependencies" narrowed to impossibilities we can see.
+// are not version-checked: we cannot vouch for them either way, and blocking on
+// them would strand well over half the universe (the canary measures ~1050 of
+// 2391 with a fully resolvable closure). But given `known`, the names CRAN and
+// Bioconductor's data repositories publish, a dependency in none of those nor
+// the index blocks (#56): it was removed upstream, and the candidate cannot
+// install. Without `known` (not fetched yet) such a dependency passes, as before.
+// This is Hervé's "no propagations that introduce impossible dependencies"
+// narrowed to impossibilities we can see.
 //
 // Approval is a fixpoint, as in BBS's makePropagationStatusDb.R: a candidate
 // blocked only by another candidate in the same wave is approved once that one
@@ -595,10 +599,16 @@ export function depConstraints(d: Desc): DepReq[] {
 // Blocked candidates come back with the unmet requirement spelled out, the way
 // BBS records an "explain" for every package: without it a package that quietly
 // stops propagating is undiagnosable after the fact.
+// The names in a PACKAGES file: what the deps rule needs from CRAN and the
+// Bioconductor data repositories, without parsing 25k full stanzas.
+export function packageNames(dcf: string): string[] {
+  return [...dcf.matchAll(/^Package:\s*(\S+)/gm)].map((m) => m[1]);
+}
+
 export type Blocked = { package: string; version: string; needs: string };
 
 export function approveByDeps<T extends { package: string; version: string; desc: Desc }>(
-  candidates: T[], idx: PropIndex
+  candidates: T[], idx: PropIndex, known?: Set<string>
 ): { approved: T[]; blocked: Blocked[] } {
   const published = new Map<string, string>(
     Object.entries(idx).map(([name, e]) => [name, e.version])
@@ -607,7 +617,10 @@ export function approveByDeps<T extends { package: string; version: string; desc
   const unmet = (d: Desc): DepReq | null => {
     for (const r of depConstraints(d)) {
       const have = published.get(r.pkg);
-      if (have === undefined) continue;
+      if (have === undefined) {
+        if (known && !known.has(r.pkg)) return r;
+        continue;
+      }
       if (r.op === ">=" && verGt(r.ver, have)) return r;
       if (r.op === ">" && !verGt(have, r.ver)) return r;
     }
@@ -632,9 +645,12 @@ export function approveByDeps<T extends { package: string; version: string; desc
     approved,
     blocked: pool.map((c) => {
       const r = reasons.get(c.package)!;
+      const have = published.get(r.pkg);
       return {
         package: c.package, version: c.version,
-        needs: `${r.pkg} (${r.op} ${r.ver}), published ${published.get(r.pkg)}`,
+        needs: have === undefined
+          ? `${r.pkg}, which is not in this repository, CRAN or Bioconductor's data repositories`
+          : `${r.pkg} (${r.op} ${r.ver}), published ${have}`,
       };
     }),
   };
@@ -682,8 +698,10 @@ export type Decision = { propagate: boolean; archs: Family[]; reasons: Reason[] 
 
 export const R_VER = /^\d+([.-]\d+)*$/;
 
+// `known`: package names published outside the index, for the deps rule (see
+// approveByDeps). Every caller passes the same stored set, readKnownDeps().
 export function gate(
-  inputs: GateInput[], config: GateConfig, idx: PropIndex
+  inputs: GateInput[], config: GateConfig, idx: PropIndex, known?: Set<string>
 ): { decisions: Record<string, Decision>; approved: string[] } {
   const decisions: Record<string, Decision> = {};
   const clear: { package: string; version: string; desc: Desc }[] = [];
@@ -720,7 +738,7 @@ export function gate(
   }
   // The dependency rule is a fixpoint over the wave, so it runs last and only
   // over candidates every other rule cleared.
-  const { approved, blocked } = approveByDeps(clear, idx);
+  const { approved, blocked } = approveByDeps(clear, idx, known);
   for (const p of approved) decisions[p.package].reasons.push({ rule: "deps", ok: true });
   for (const b of blocked) {
     const d = decisions[b.package];

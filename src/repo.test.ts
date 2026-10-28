@@ -1,7 +1,7 @@
 // node --test --experimental-strip-types src/repo.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { approveByDeps, binaryArtifacts, seedBinaryTopUp, topUpBinaries, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, waveGateConfig, writeOnce } from "./repo.ts";
+import { approveByDeps, packageNames, binaryArtifacts, seedBinaryTopUp, topUpBinaries, buildManifest, gate, rejectedRule, depConstraints, described, describe, findArtifact, gateFamily, isLogEntry, macArmDir, metaOf, originOf, packagesDcf, parseDcf, parseGitmodules, parseRepoDir, parseZipCentral, passingFamilies, matchSel, pendingArtifacts, pendingJobIds, planCompaction, mergeMeta, mergeRows, seedArtifacts, seedDesc, seedMeta, verGt, viewsDcf, waveGateConfig, writeOnce } from "./repo.ts";
 
 const IDX = {
   S4Vectors: {
@@ -732,6 +732,41 @@ test("approveByDeps: dependencies we do not publish are not our business", () =>
     desc: { Depends: "S4Vectors (>= 0.51.8)", Imports: "Rcpp (>= 99.0.0), crisprScoreData" },
   }], idx);
   assert.deepEqual(approved.map((c) => c.package), ["edgeR"]);
+});
+
+// #56: with the outside world's package names in hand, a dependency that is in
+// none of them -- removed from Bioconductor, archived on CRAN -- is not "someone
+// else's business", it is uninstallable. Measured 2026-09-28: Melissa needs
+// BPRMeth, which left Bioconductor; r-universe still builds Melissa.
+test("approveByDeps: a hard dependency nobody publishes blocks, once names are known", () => {
+  const idx = { S4Vectors: { version: "0.51.9" } } as never;
+  const known = new Set(["Rcpp", "crisprScoreData"]);
+  const melissa = { package: "Melissa", version: "1.26.0", desc: { Imports: "BPRMeth, Rcpp, S4Vectors" } };
+  const edger = {
+    package: "edgeR", version: "4.10.1",
+    desc: { Depends: "S4Vectors (>= 0.51.8)", Imports: "Rcpp (>= 99.0.0), crisprScoreData", Suggests: "Gone" },
+  };
+  const { approved, blocked } = approveByDeps([melissa, edger], idx, known);
+  assert.deepEqual(approved.map((c) => c.package), ["edgeR"], "Suggests never blocks");
+  assert.deepEqual(blocked, [{
+    package: "Melissa", version: "1.26.0",
+    needs: "BPRMeth, which is not in this repository, CRAN or Bioconductor's data repositories",
+  }]);
+  // Without the names (fetch failed, not refreshed yet) the old rule stands.
+  assert.deepEqual(approveByDeps([melissa], idx).approved.map((c) => c.package), ["Melissa"]);
+});
+
+test("approveByDeps: a dependency approved in the same wave counts as published", () => {
+  const { approved } = approveByDeps([
+    { package: "Ularcirc", version: "1.0.0", desc: { Imports: "Organism.dplyr" } },
+    { package: "Organism.dplyr", version: "1.40.0", desc: { Imports: "stats" } },
+  ], {} as never, new Set());
+  assert.deepEqual(approved.map((c) => c.package), ["Organism.dplyr", "Ularcirc"]);
+});
+
+test("packageNames: every Package: field of a PACKAGES file", () => {
+  const dcf = "Package: A3\nVersion: 1.0.0\nDepends: R (>= 2.15.0)\n\nPackage: abc.data\nVersion: 1.1\n";
+  assert.deepEqual(packageNames(dcf), ["A3", "abc.data"]);
 });
 
 test("approveByDeps: a mutual dependency cycle cannot deadlock the whole wave", () => {
