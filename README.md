@@ -1,3 +1,7 @@
+> **Moved.** This repository is archived. Its code, history and open issues now live in
+> [seandavi/bioc-infrastructure](https://github.com/seandavi/bioc-infrastructure/tree/main/packages/registry)
+> as `packages/registry` ([ADR 0014](https://github.com/seandavi/bioc-infrastructure/blob/main/adr/0014-one-platform-repo-the-website-build-and-manifest-stay-separate.md)).
+
 # bioc-registry
 
 [![test](https://github.com/seandavi/bioc-registry/actions/workflows/test.yml/badge.svg)](https://github.com/seandavi/bioc-registry/actions/workflows/test.yml)
